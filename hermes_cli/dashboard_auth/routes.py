@@ -201,8 +201,18 @@ async def auth_login(request: Request, provider: str, next: str = ""):
             login_url = f"{login_url}?next={quote(safe_next, safe='')}"
         return RedirectResponse(url=login_url, status_code=302)
 
+    # Basic auth (password-only) has no OAuth redirect — render the
+    # password form inline instead of crashing in start_login().
+    from .login_page import _render_password_form
+    if getattr(p, "provider_name", None) == "basic" or not hasattr(p, "start_login"):
+        html = _render_password_form(p, next)
+        return HTMLResponse(html)
+
     try:
         ls = p.start_login(redirect_uri=_redirect_uri(request))
+    except NotImplementedError:
+        html = _render_password_form(p, next)
+        return HTMLResponse(html)
     except ProviderError as e:
         audit_log(
             AuditEvent.LOGIN_FAILURE,
