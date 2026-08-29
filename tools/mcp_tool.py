@@ -586,7 +586,17 @@ _MAX_BACKOFF_SECONDS = 60
 # wakes on this cadence and attempts one revival probe. Without it a parked
 # server is unrevivable: its tools are out of the registry, so no tool call
 # can ever reach the circuit-breaker half-open probe or _signal_reconnect.
-_PARKED_RETRY_INTERVAL = 300     # seconds between parked self-probes
+_PARKED_RETRY_INTERVAL = 300     # seconds between parked self-probes (steady-state)
+_PARKED_RETRY_INTERVAL_FAST = 60  # Hermes patch 2026-08-21: faster probes for fresh failures
+
+def _adaptive_parked_interval(probe_count):
+    """Hermes patch 2026-08-21: 60s/60s/60s then 180s/180s/180s then 300s."""
+    if probe_count < 3:
+        return _PARKED_RETRY_INTERVAL_FAST
+    elif probe_count < 6:
+        return 180
+    return _PARKED_RETRY_INTERVAL
+
 _RECYCLED_RECONNECT_TIMEOUT = 15.0
 # Jitter applied to reconnect backoff sleeps. Without it, every server that
 # lost the same backend retries in lockstep (thundering herd) and log lines
@@ -2437,6 +2447,7 @@ class MCPServerTask:
         # until the session proves healthy again — used to log the
         # parked→revived transition exactly once.
         self._was_parked: bool = False
+        self._parked_probe_count: int = 0  # Hermes patch 2026-08-21
         # In-flight RPC bookkeeping (#48069 salvage): user-visible requests
         # registered while running so a reconnect/shutdown teardown can fail
         # them fast instead of orphaning them on a dying transport.
@@ -4095,8 +4106,9 @@ class MCPServerTask:
                         self._deregister_tools()
                         self._reconnect_event.clear()
                         parked = await self._wait_for_reconnect_or_shutdown(
-                            timeout=_PARKED_RETRY_INTERVAL
+                            timeout=_adaptive_parked_interval(self._parked_probe_count)
                         )
+                        self._parked_probe_count += 1  # Hermes patch 2026-08-21
                         if parked == "shutdown":
                             break
                         logger.debug(
@@ -4193,8 +4205,9 @@ class MCPServerTask:
                         self._deregister_tools()
                         self._reconnect_event.clear()
                         parked = await self._wait_for_reconnect_or_shutdown(
-                            timeout=_PARKED_RETRY_INTERVAL
+                            timeout=_adaptive_parked_interval(self._parked_probe_count)
                         )
+                        self._parked_probe_count += 1  # Hermes patch 2026-08-21
                         if parked == "shutdown":
                             return
                         logger.debug(
@@ -4225,8 +4238,9 @@ class MCPServerTask:
                         self._deregister_tools()
                         self._reconnect_event.clear()
                         parked = await self._wait_for_reconnect_or_shutdown(
-                            timeout=_PARKED_RETRY_INTERVAL
+                            timeout=_adaptive_parked_interval(self._parked_probe_count)
                         )
+                        self._parked_probe_count += 1  # Hermes patch 2026-08-21
                         if parked == "shutdown":
                             return
                         logger.debug(
@@ -4313,8 +4327,9 @@ class MCPServerTask:
                     self._deregister_tools()
                     self._reconnect_event.clear()
                     parked = await self._wait_for_reconnect_or_shutdown(
-                        timeout=_PARKED_RETRY_INTERVAL
+                        timeout=_adaptive_parked_interval(self._parked_probe_count)
                     )
+                    self._parked_probe_count += 1  # Hermes patch 2026-08-21
                     if parked == "shutdown":
                         return
                     logger.debug(
@@ -4352,8 +4367,9 @@ class MCPServerTask:
                     self._deregister_tools()
                     self._reconnect_event.clear()
                     parked = await self._wait_for_reconnect_or_shutdown(
-                        timeout=_PARKED_RETRY_INTERVAL
+                        timeout=_adaptive_parked_interval(self._parked_probe_count)
                     )
+                    self._parked_probe_count += 1  # Hermes patch 2026-08-21
                     if parked == "shutdown":
                         return
                     logger.debug(
