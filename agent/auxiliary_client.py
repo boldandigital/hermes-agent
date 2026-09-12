@@ -4565,6 +4565,37 @@ def _resolve_xai_oauth_branch(req: _ResolveRequest) -> _ResolveResult:
                           "OAuth token found (run: hermes model -> xAI Grok OAuth — SuperGrok / Premium+)")
 
 
+def _build_minimax_oauth_aux_client(model: str) -> Tuple[Optional[Any], Optional[str]]:
+    """MiniMax OAuth (Anthropic Messages via minimax-oauth PKCE flow). Returns (None, None) without
+    a fresh access token. Uses a per-request token provider because MiniMax tokens live ~15 min and
+    the Anthropic SDK freezes api_key at construction (mirrors agent/agent_init.py:727)."""
+    try:
+        from hermes_cli.auth_minimax import resolve_minimax_oauth_runtime_credentials
+        creds = resolve_minimax_oauth_runtime_credentials(as_token_provider=True)
+    except Exception as exc:  # noqa: BLE001 — never block aux dispatch on missing creds
+        logger.debug("MiniMax OAuth aux creds unavailable: %s", exc)
+        return None, None
+    api_key = creds["api_key"]
+    base_url = creds["base_url"]
+    if not api_key or not base_url:
+        return None, None
+    logger.debug("Auxiliary client: MiniMax OAuth (%s via Anthropic Messages)", model or "<default>")
+    real_client = _create_openai_client(api_key="placeholder", base_url=base_url)
+    return _maybe_wrap_anthropic(
+        real_client, model, api_key, base_url, api_mode="anthropic_messages"
+    ), model
+
+
+def _resolve_minimax_oauth_branch(req: _ResolveRequest) -> _ResolveResult:
+    """MiniMax OAuth (Anthropic Messages). Without this branch minimax-oauth falls through the generic
+    PROVIDER_REGISTRY arm, returns (None, None), and silently no-ops every aux task (MoA references,
+    aggregator, vision, compression, title gen, web_extract, etc.)."""
+    client, default = _build_minimax_oauth_aux_client(req.model)
+    return _route_or_warn(req, client, default,
+                          "resolve_provider_client: minimax-oauth requested but no MiniMax "
+                          "OAuth token found (run: hermes model -> MiniMax OAuth)")
+
+
 def _resolve_custom_branch(req: _ResolveRequest) -> _ResolveResult:
     """Custom endpoint (OPENAI_BASE_URL + OPENAI_API_KEY)."""
     provider, model, main_runtime = req.provider, req.model, req.main_runtime
@@ -4860,6 +4891,7 @@ _EXPLICIT_PROVIDER_BRANCHES: Dict[str, Callable[[_ResolveRequest], _ResolveResul
     "nous": _resolve_nous_branch,
     "openai-codex": _resolve_openai_codex_branch,
     "xai-oauth": _resolve_xai_oauth_branch,
+    "minimax-oauth": _resolve_minimax_oauth_branch,
     "custom": _resolve_custom_branch,
 }
 
