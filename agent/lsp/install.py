@@ -36,6 +36,10 @@ def _manual(bin_name: str) -> Dict[str, Any]:
     return _recipe("manual", "", bin_name)
 
 
+# TypeScript 7+ is the Go-native port and ships no ``lib/tsserver.js`` /
+# ``lib/typescript.js``, so JS-based servers cannot load it as their SDK.
+TYPESCRIPT_SDK_PKG = "typescript@6"
+
 # Recipe key → {strategy, pkg, bin[, extra_pkgs]}.  After install we look for
 # ``bin`` in ``<HERMES_HOME>/lsp/bin/`` first, then on PATH.  ``extra_pkgs``
 # are sibling npm packages a server needs in the same node_modules tree.
@@ -43,8 +47,12 @@ INSTALL_RECIPES: Dict[str, Dict[str, Any]] = {
     "pyright": _npm("pyright", "pyright-langserver"),
     # tsserver must be importable from the same node_modules tree or
     # initialize() fails with "Could not find a valid TypeScript installation".
-    "typescript-language-server": _npm("typescript-language-server", "typescript-language-server", extra_pkgs=["typescript"]),
-    "@vue/language-server": _npm("@vue/language-server", "vue-language-server"),
+    "typescript-language-server": _npm("typescript-language-server", "typescript-language-server", extra_pkgs=[TYPESCRIPT_SDK_PKG]),
+    # 3.x forwards every TypeScript request to a client-hosted tsserver
+    # (``tsserver/request`` tunnel) that a generic LSP client does not run, so
+    # it never publishes diagnostics; 2.x self-hosts TypeScript from
+    # ``initializationOptions.typescript.tsdk`` (see servers._spawn_vue).
+    "@vue/language-server": _npm("@vue/language-server@2", "vue-language-server", extra_pkgs=[TYPESCRIPT_SDK_PKG]),
     "svelte-language-server": _npm("svelte-language-server", "svelteserver"),
     "@astrojs/language-server": _npm("@astrojs/language-server", "astro-ls"),
     "yaml-language-server": _npm("yaml-language-server", "yaml-language-server"),
@@ -57,6 +65,8 @@ INSTALL_RECIPES: Dict[str, Dict[str, Any]] = {
     "rust-analyzer": _manual("rust-analyzer"),
     "clangd": _manual("clangd"),
     "lua-language-server": _manual("lua-language-server"),
+    # laravel-lsp ships via composer (`composer global require laravel/lsp`), not npm.
+    "laravel-lsp": _manual("laravel-lsp"),
     # PowerShellEditorServices is a release-zip bundle driven by pwsh; we probe
     # the host so `hermes lsp status` reports its presence.
     "powershell": _manual("pwsh"),
@@ -81,27 +91,43 @@ def hermes_lsp_bin_dir() -> Path:
     return p
 
 
-def _native_binary_candidates(base: Path) -> list[Path]:
-    """Return platform-native executable candidates for a staged binary (``base`` plus Windows wrappers)."""
-    if not _is_windows():
+def _native_binary_candidates(base: Path, *, is_windows: Optional[bool] = None) -> list[Path]:
+    """Return platform-native executable candidates for a staged binary, most runnable first.
+
+    On Windows the ``.cmd``/``.exe``/``.bat`` wrappers come BEFORE the bare name: npm writes a
+    POSIX ``#!/bin/sh`` shim under the bare name next to its ``.cmd``, ``os.access(X_OK)`` is
+    always true there, and ``CreateProcess`` on the shim fails with WinError 193.  The bare name
+    stays as a last resort for genuinely extension-less executables.
+    """
+    if not (_is_windows() if is_windows is None else is_windows):
         return [base]
     cands: Dict[str, Path] = {}
-    for c in (base, *(Path(str(base) + s) for s in _WINDOWS_WRAPPER_SUFFIXES)):
+    for c in (*(Path(str(base) + s) for s in _WINDOWS_WRAPPER_SUFFIXES), base):
         cands.setdefault(str(c).lower(), c)
     return list(cands.values())
 
 
-def _first_existing(*bases: Path) -> Optional[Path]:
+def _first_existing(*bases: Path, is_windows: Optional[bool] = None) -> Optional[Path]:
     """First platform-native candidate of any ``base`` that exists on disk."""
-    return next((c for base in bases for c in _native_binary_candidates(base) if c.exists()), None)
+    return next((c for base in bases for c in _native_binary_candidates(base, is_windows=is_windows) if c.exists()), None)
 
 
-def _existing_binary(name: str) -> Optional[str]:
-    """Probe the staging dir + PATH for a binary named ``name``."""
-    for staged in _native_binary_candidates(hermes_lsp_bin_dir() / name):
+def _npm_bin_dir() -> Path:
+    """npm's own ``node_modules/.bin`` under the staging tree, where its ``%~dp0``-relative wrappers work."""
+    return hermes_lsp_bin_dir().parent / "node_modules" / ".bin"
+
+
+def _existing_binary(name: str, *, is_windows: Optional[bool] = None) -> Optional[str]:
+    """Probe the staging dir (+ npm's bin dir on Windows) then PATH for a binary named ``name``.
+
+    ``is_windows`` overrides the host check so the Windows resolution is testable as data on every lane.
+    """
+    win = _is_windows() if is_windows is None else is_windows
+    bases = [hermes_lsp_bin_dir() / name] + ([_npm_bin_dir() / name] if win else [])
+    for staged in (c for base in bases for c in _native_binary_candidates(base, is_windows=win)):
         if staged.exists() and os.access(staged, os.X_OK):
             return str(staged)
-    suffixes = ("", *_WINDOWS_WRAPPER_SUFFIXES) if _is_windows() else ("",)
+    suffixes = (*_WINDOWS_WRAPPER_SUFFIXES, "") if win else ("",)
     return next((p for s in suffixes if (p := shutil.which(f"{name}{s}"))), None)
 
 
@@ -188,7 +214,9 @@ def _install_npm(pkg: str, bin_name: str, extra_pkgs: Optional[list] = None) -> 
         return None
     found = _first_existing(staging / "node_modules" / ".bin" / bin_name)
     if found is not None:
-        return _link_into_bin(found)
+        # npm's Windows wrappers resolve their payload via ``%~dp0\..\<pkg>``, so a copy or symlink
+        # in ``lsp/bin/`` points at nothing; use them where npm put them (``_existing_binary`` probes there).
+        return str(found) if _is_windows() and found.suffix.lower() in (".cmd", ".bat") else _link_into_bin(found)
     logger.warning("[install] npm install for %s succeeded but bin %s not found", pkg, bin_name)
     return None
 

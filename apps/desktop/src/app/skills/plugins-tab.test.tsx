@@ -1,14 +1,25 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { $pluginRecords } from '@/contrib/plugins-store'
 import { $agentPlugins, $agentPluginsStatus } from '@/store/agent-plugins'
 import { $paneHeightOverride, setPaneHeightOverride } from '@/store/panes'
 import { $pluginInstallRequest, closePluginInstallRequest } from '@/store/plugin-install-request'
+import { $connection } from '@/store/session'
 
 import { PluginsTab } from './plugins-tab'
 
 const requestGateway = vi.fn(async () => ({ plugins: [] }))
+
+const connectionFixture = {
+  baseUrl: 'http://localhost',
+  isFullscreen: false,
+  logs: [],
+  nativeOverlayWidth: 0,
+  token: '',
+  windowButtonPosition: null,
+  wsUrl: ''
+}
 
 vi.mock('@/app/gateway/hooks/use-gateway-request', () => ({
   useGatewayRequest: () => ({ requestGateway })
@@ -23,7 +34,10 @@ describe('PluginsTab', () => {
     requestGateway.mockClear()
   })
 
-  afterEach(cleanup)
+  afterEach(() => {
+    cleanup()
+    $connection.set(null)
+  })
 
   it('lists the scoped profile agent plugins with toggles', () => {
     $agentPlugins.set([
@@ -59,6 +73,50 @@ describe('PluginsTab', () => {
 
     expect(screen.queryByText('fal')).toBeNull()
     expect(screen.getByText(/No plugins yet/)).toBeTruthy()
+  })
+
+  // A desktop half can only be copied out of a backend that runs on THIS
+  // machine; against a remote one the reconcile is a structural no-op, so the
+  // row must say so instead of pending forever (#114079).
+  it('marks a remote-backend desktop half unavailable instead of forever copying', () => {
+    $connection.set({ ...connectionFixture, mode: 'remote' })
+    $agentPlugins.set([
+      {
+        description: '',
+        has_desktop_half: true,
+        key: 'nous-prices',
+        name: 'nous-prices',
+        source: 'catalog',
+        status: 'enabled',
+        version: '1'
+      }
+    ])
+
+    render(<PluginsTab profile={null} />)
+
+    const detail = within(screen.getByRole('row', { name: /^nous-prices/ }))
+    expect(detail.getByText('unavailable (remote backend)')).toBeTruthy()
+    expect(detail.queryByText('copying…')).toBeNull()
+  })
+
+  it('keeps the pending desktop-half state on a local backend', () => {
+    $agentPlugins.set([
+      {
+        description: '',
+        has_desktop_half: true,
+        key: 'nous-prices',
+        name: 'nous-prices',
+        source: 'catalog',
+        status: 'enabled',
+        version: '1'
+      }
+    ])
+
+    render(<PluginsTab profile={null} />)
+
+    const detail = within(screen.getByRole('row', { name: /^nous-prices/ }))
+    expect(detail.getByText('copying…')).toBeTruthy()
+    expect(detail.queryByText('unavailable (remote backend)')).toBeNull()
   })
 
   it('renders a unified package as ONE row with a Desktop switch and an Agent switch', () => {
