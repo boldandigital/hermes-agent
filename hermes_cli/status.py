@@ -108,7 +108,7 @@ def _estop_status_line():
 _TERMINAL_ENV_ROWS = {
     "ssh": (("SSH Host:", "TERMINAL_SSH_HOST", "(not set)", True), ("SSH User:", "TERMINAL_SSH_USER", "(not set)", True)),
     "docker": (("Docker Image:", "TERMINAL_DOCKER_IMAGE", "python:3.11-slim", False),),
-    "daytona": (("Daytona Image:", "TERMINAL_DAYTONA_IMAGE", "nikolaik/python-nodejs:python3.11-nodejs20", False),),
+    "daytona": (("Daytona Image:", "TERMINAL_DAYTONA_IMAGE", "nikolaik/python-nodejs:python3.14-nodejs22", False),),
 }
 
 _PLATFORMS = {  # name -> (token env var, home-channel env var or None)

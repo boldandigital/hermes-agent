@@ -232,9 +232,9 @@ terminal:
   home_mode: auto   # auto | real | profile — subprocess HOME policy
   env_passthrough: []  # Env var names to forward to sandboxed execution (terminal + execute_code)
   sync_back_max_bytes: 2147483648  # Remote backends: refuse to extract a state archive larger than this (bytes)
-  singularity_image: "docker://nikolaik/python-nodejs:python3.11-nodejs20"  # Container image for Singularity backend
-  modal_image: "nikolaik/python-nodejs:python3.11-nodejs20"                 # Container image for Modal backend
-  daytona_image: "nikolaik/python-nodejs:python3.11-nodejs20"               # Container image for Daytona backend
+  singularity_image: "docker://nikolaik/python-nodejs:python3.14-nodejs22"  # Container image for Singularity backend
+  modal_image: "nikolaik/python-nodejs:python3.14-nodejs22"                 # Container image for Modal backend
+  daytona_image: "nikolaik/python-nodejs:python3.14-nodejs22"               # Container image for Daytona backend
 ```
 
 `terminal.temp_dir` controls where Hermes puts session temp artifacts on the
@@ -354,7 +354,7 @@ Runs commands inside a Docker container with security hardening (all capabilitie
 ```yaml
 terminal:
   backend: docker
-  docker_image: "nikolaik/python-nodejs:python3.11-nodejs20"
+  docker_image: "nikolaik/python-nodejs:python3.14-nodejs22"
   docker_mount_cwd_to_workspace: false  # Mount launch dir into /workspace
   docker_run_as_host_user: false   # See "Running container as host user" below
   docker_snap_compat: false        # See "Snap-packaged Docker (AppArmor)" below
@@ -583,7 +583,7 @@ Runs commands in a [Singularity/Apptainer](https://apptainer.org) container. Des
 ```yaml
 terminal:
   backend: singularity
-  singularity_image: "docker://nikolaik/python-nodejs:python3.11-nodejs20"
+  singularity_image: "docker://nikolaik/python-nodejs:python3.14-nodejs22"
   container_cpu: 1                 # CPU cores
   container_memory: 5120           # MB
   container_persistent: true       # Writable overlay persists across sessions

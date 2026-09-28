@@ -2885,6 +2885,20 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # Board slug — defense-in-depth pin if a path is resolved without the
     # DB / workspaces env vars.
     env["HERMES_KANBAN_BOARD"] = _kb._normalize_board_slug(board) or _kb.get_current_board()
+    # PYTHONPATH fix: when the dispatcher runs under a system-installed Python
+    # (e.g. /Users/lars/.hermes/tools/python-3.14.7/...) but hermes_cli lives
+    # under a different repo root (e.g. /Users/lars/.hermes/hermes-agent/),
+    # `python -m hermes_cli.main` raises ModuleNotFoundError. Prepend the
+    # dispatcher's own hermes-agent root so the worker can import hermes_cli.
+    # This mirrors what the wrapper script /Users/lars/.hermes/local/bin/hermes
+    # does when it imports hermes_cli.main at startup. Idempotent — set even
+    # when the wrapper path is used so any nested `python -m` invocations work.
+    hermes_repo_root = str(Path(__file__).resolve().parent.parent)
+    existing_pp = env.get("PYTHONPATH", "")
+    if hermes_repo_root not in existing_pp.split(":"):
+        env["PYTHONPATH"] = (
+            f"{hermes_repo_root}{os.pathsep}{existing_pp}" if existing_pp else hermes_repo_root
+        )
     # kanban_comment reads HERMES_PROFILE for its default author; `-p` alone
     # doesn't set the env var.
     env["HERMES_PROFILE"] = profile_arg

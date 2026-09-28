@@ -184,7 +184,7 @@ def _mirror_config_to_env(defaults, _file_has_terminal_config):
 
 def _cli_config_defaults():
     """Built-in defaults for every config key the CLI reads (the file overlays these)."""
-    img = "nikolaik/python-nodejs:python3.11-nodejs20"
+    img = "nikolaik/python-nodejs:python3.14-nodejs22"
     return {
         "model": {"default": "", "base_url": "", "provider": "auto"},
         "terminal": {

@@ -13,7 +13,7 @@ from hermes_cli import nous_subscription
 
 logger = logging.getLogger("hermes_cli.setup")
 
-_SANDBOX_IMAGE = "nikolaik/python-nodejs:python3.11-nodejs20"
+_SANDBOX_IMAGE = "nikolaik/python-nodejs:python3.14-nodejs22"
 _RUN_KW = dict(capture_output=True, text=True, encoding="utf-8", errors="replace")
 
 
