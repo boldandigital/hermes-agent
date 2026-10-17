@@ -548,6 +548,231 @@ class TestBuildPreloadedSkillsPrompt:
         assert "enabled-skill" in prompt
 
 
+    def test_disabled_skill_is_reported_as_disabled_not_unknown(self, tmp_path, monkeypatch):
+        """A pinned skill that only exists because the operator disabled it must not be called unknown:
+        it is on disk, and the error line has to say so."""
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "disabled-skill", body="SECRET DISABLED CONTENT.")
+
+            import agent.skill_utils as su_module
+            from agent.skill_commands import format_missing_skills
+            monkeypatch.setattr(
+                su_module, "get_disabled_skill_names", lambda platform=None: {"disabled-skill"}
+            )
+
+            disabled: list = []
+            prompt, loaded, missing = build_preloaded_skills_prompt(
+                ["disabled-skill"], disabled_out=disabled
+            )
+
+        assert loaded == []
+        assert disabled == ["disabled-skill"]
+        assert "SECRET DISABLED CONTENT." not in prompt
+        message = format_missing_skills(missing, disabled)
+        assert message == "Disabled skill(s): disabled-skill"
+
+
+    def test_disabled_skill_reported_when_skill_view_refuses_the_load(self, tmp_path, monkeypatch):
+        """The PRODUCTION seam: ``skill_view`` refuses a disabled skill, so ``load()`` returns None.
+
+        This is the regression that made the whole message change a no-op. ``_load_skill_blocks`` used to
+        test the disabled list only AFTER a successful load — but a disabled skill never loads, because
+        ``skill_view`` (``tools/skills_tool._is_skill_disabled``) rejects it first and
+        ``_load_skill_payload`` swallows that into ``None``. So the pin fell into *missing*, *disabled*
+        stayed empty, and every real seat still printed "Unknown skill(s)" for a skill sitting on disk.
+
+        The earlier disabled-skill tests patch ``get_disabled_skill_names`` only, which leaves
+        ``skill_view`` free to load the skill — so they pass through the post-load branch that production
+        never reaches. Both seams are patched here so the load genuinely fails.
+        """
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", tmp_path),
+            patch("tools.skills_tool._is_skill_disabled", return_value=True),
+        ):
+            _make_skill(tmp_path, "disabled-skill", body="SECRET DISABLED CONTENT.")
+
+            import agent.skill_utils as su_module
+            from agent.skill_commands import format_missing_skills, _load_skill_payload
+            monkeypatch.setattr(
+                su_module, "get_disabled_skill_names", lambda platform=None: {"disabled-skill"}
+            )
+
+            # Precondition: prove the loader really does refuse, so this test cannot silently pass on a
+            # seam where the skill loads after all.
+            assert _load_skill_payload("disabled-skill") is None
+
+            disabled: list = []
+            prompt, loaded, missing = build_preloaded_skills_prompt(
+                ["disabled-skill"], disabled_out=disabled
+            )
+
+        assert loaded == []
+        assert "SECRET DISABLED CONTENT." not in prompt
+        # Still reported as missing (the skill is not loaded), but ALSO recorded as disabled, which is the
+        # fact that lets the message say "Disabled skill(s)" instead of "Unknown skill(s)".
+        assert missing == ["disabled-skill"]
+        assert disabled == ["disabled-skill"]
+        message = format_missing_skills(missing, disabled)
+        assert message == "Disabled skill(s): disabled-skill"
+        assert "Unknown skill" not in message
+
+
+    def test_disabled_and_unknown_split_even_when_the_load_is_refused(self, tmp_path, monkeypatch):
+        """Both clauses on one line when skill_view refuses the disabled half but not the typo."""
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", tmp_path),
+            patch("tools.skills_tool._is_skill_disabled", side_effect=lambda *a, **k: "disabled-skill" in a),
+        ):
+            _make_skill(tmp_path, "enabled-skill")
+            _make_skill(tmp_path, "disabled-skill")
+
+            import agent.skill_utils as su_module
+            from agent.skill_commands import format_missing_skills
+            monkeypatch.setattr(
+                su_module, "get_disabled_skill_names", lambda platform=None: {"disabled-skill"}
+            )
+
+            disabled: list = []
+            _, loaded, missing = build_preloaded_skills_prompt(
+                ["enabled-skill", "disabled-skill", "no-such-skill"], disabled_out=disabled
+            )
+
+        assert loaded == ["enabled-skill"]
+        assert disabled == ["disabled-skill"]
+        message = format_missing_skills(missing, disabled)
+        assert "Unknown skill(s): no-such-skill" in message
+        assert "Disabled skill(s): disabled-skill" in message
+        assert "Unknown skill(s): disabled-skill" not in message
+
+
+    def test_disabled_skill_pinned_by_path_is_not_called_unknown(self, tmp_path, monkeypatch):
+        """A pin given as an absolute path (slash commands / cron store these) must resolve to the
+        disabled name, not report a present skill as unknown.
+
+        ``normalize_skill_lookup_name`` turns an absolute path into ``<name>/SKILL.md``, which is not
+        itself a disabled key, so the owning segment has to be compared too. Without that,
+        ``-s /abs/path/to/<disabled-skill>/SKILL.md`` printed "Unknown skill(s)" for a skill that is
+        sitting on disk and merely switched off.
+        """
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", tmp_path),
+            patch("tools.skills_tool._is_skill_disabled", return_value=True),
+        ):
+            _make_skill(tmp_path, "disabled-skill", body="SECRET DISABLED CONTENT.")
+
+            import agent.skill_utils as su_module
+            from agent.skill_commands import format_missing_skills
+            monkeypatch.setattr(
+                su_module, "get_disabled_skill_names", lambda platform=None: {"disabled-skill"}
+            )
+
+            disabled: list = []
+            prompt, loaded, missing = build_preloaded_skills_prompt(
+                [str(tmp_path / "disabled-skill" / "SKILL.md")], disabled_out=disabled
+            )
+
+        assert loaded == []
+        assert "SECRET DISABLED CONTENT." not in prompt
+        assert disabled, "a disabled skill pinned by path must be recognised as disabled"
+        assert "Unknown skill(s)" not in format_missing_skills(missing, disabled)
+        assert "Disabled skill(s)" in format_missing_skills(missing, disabled)
+
+
+    def test_disabled_skill_caught_when_the_loaded_name_differs_from_the_pin(self, tmp_path, monkeypatch):
+        """The post-load branch: the body LOADS, but the canonical name is what the operator disabled.
+
+        The pre-load gate compares the pinned identifier; this covers the other side — a skill whose
+        frontmatter name differs from the pin, so only the loaded canonical name is disabled. Dropping
+        the post-load gate would let that load force a disabled skill through, so the assertion is that
+        it is refused like every other disabled pin.
+        """
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "on-disk-dir", body="SECRET DISABLED CONTENT.")
+
+            import agent.skill_commands as sc_module
+            import agent.skill_utils as su_module
+            from agent.skill_commands import format_missing_skills
+            # The pin's directory is NOT disabled; the frontmatter name it resolves to IS.
+            monkeypatch.setattr(
+                su_module, "get_disabled_skill_names", lambda platform=None: {"renamed-on-disk"}
+            )
+            # The loader succeeds and reports a canonical name that differs from the pinned identifier.
+            monkeypatch.setattr(
+                sc_module, "_load_skill_payload",
+                lambda ident, task_id=None: ({"content": "SECRET DISABLED CONTENT."}, tmp_path,
+                                             "renamed-on-disk"),
+            )
+
+            disabled: list = []
+            prompt, loaded, missing = build_preloaded_skills_prompt(
+                ["on-disk-dir"], disabled_out=disabled
+            )
+
+        assert loaded == []
+        assert "SECRET DISABLED CONTENT." not in prompt
+        assert disabled, "a disabled canonical name must be caught even when the pin differs"
+        assert "Unknown skill(s)" not in format_missing_skills(missing, disabled)
+        assert "Disabled skill(s)" in format_missing_skills(missing, disabled)
+
+
+    def test_mixed_disabled_and_unknown_report_both_clauses_once(self, tmp_path, monkeypatch):
+        """One launch pinning a disabled skill and a typo: both facts on one line, each named once —
+        the disabled skill is never also listed as unknown."""
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "enabled-skill")
+            _make_skill(tmp_path, "disabled-skill")
+
+            import agent.skill_utils as su_module
+            from agent.skill_commands import format_missing_skills
+            monkeypatch.setattr(
+                su_module, "get_disabled_skill_names", lambda platform=None: {"disabled-skill"}
+            )
+
+            disabled: list = []
+            _, loaded, missing = build_preloaded_skills_prompt(
+                ["enabled-skill", "disabled-skill", "no-such-skill"], disabled_out=disabled
+            )
+
+        assert loaded == ["enabled-skill"]
+        assert disabled == ["disabled-skill"]
+        message = format_missing_skills(missing, disabled)
+        assert "Unknown skill(s): no-such-skill" in message
+        assert "Disabled skill(s): disabled-skill" in message
+        assert "Unknown skill(s): disabled-skill" not in message
+        assert message.count("disabled-skill") == 1
+
+
+    def test_genuinely_unknown_skill_still_reports_only_unknown(self, tmp_path):
+        """The unknown-skill wording is unchanged when nothing was disabled."""
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            from agent.skill_commands import format_missing_skills
+
+            disabled: list = []
+            _, loaded, missing = build_preloaded_skills_prompt(
+                ["no-such-skill"], disabled_out=disabled
+            )
+
+        assert loaded == []
+        assert disabled == []
+        assert format_missing_skills(missing, disabled) == "Unknown skill(s): no-such-skill"
+
+
+    def test_disabled_out_defaults_to_todays_behaviour(self, tmp_path, monkeypatch):
+        """Callers that don't ask for the disabled names get the same 3-tuple as before."""
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "disabled-skill")
+
+            import agent.skill_utils as su_module
+            monkeypatch.setattr(
+                su_module, "get_disabled_skill_names", lambda platform=None: {"disabled-skill"}
+            )
+
+            result = build_preloaded_skills_prompt(["disabled-skill"])
+
+        assert len(result) == 3
+        assert result[1:] == ([], ["disabled-skill"])
+
+
 class TestDuplicateNamesAgreeAcrossSurfaces:
     def test_every_surface_resolves_duplicates_like_skill_view(self, tmp_path, monkeypatch, caplog):
         """#64392: list, prompt index, slash commands, skill_view, -s preload and cron agree. A same-tier

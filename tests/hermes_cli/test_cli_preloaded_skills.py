@@ -81,3 +81,31 @@ def test_main_raises_for_unknown_preloaded_skill(monkeypatch):
     # finalized (agent init), preserving the fail-loud contract.
     with pytest.raises(ValueError, match=r"Unknown skill\(s\): missing-skill"):
         _real_finalize(created["cli"])
+
+def test_main_reports_disabled_preloaded_skill_as_disabled(monkeypatch):
+    """A pinned skill the operator disabled lives on disk, so the hard failure at agent init must name
+    it as disabled — telling an operator to look for a missing file is the bug this guards."""
+    import cli as cli_mod
+
+    created = {}
+
+    def fake_cli(**kwargs):
+        created["cli"] = _DummyCLI(**kwargs)
+        return created["cli"]
+
+    def fake_preload(skills, task_id=None, excluded_loaded_names=None, disabled_out=None):
+        # Same shape the real builder returns for a disabled pin: nothing loaded, the name folded
+        # into missing and reported through disabled_out.
+        if disabled_out is not None:
+            disabled_out.append("disabled-skill")
+        return "", [], ["disabled-skill"]
+
+    monkeypatch.setattr(cli_mod, "HermesCLI", fake_cli)
+    monkeypatch.setattr(cli_mod, "build_preloaded_skills_prompt", fake_preload)
+
+    with pytest.raises(SystemExit):
+        cli_mod.main(skills="disabled-skill", list_tools=True)
+
+    with pytest.raises(ValueError, match=r"Disabled skill\(s\): disabled-skill") as excinfo:
+        _real_finalize(created["cli"])
+    assert "Unknown skill" not in str(excinfo.value)

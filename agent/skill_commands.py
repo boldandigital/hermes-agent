@@ -267,12 +267,22 @@ def _missing_skill_label(identifier: str) -> str:
     return ambiguous_skill_label(identifier, payload) or identifier
 
 
-def format_missing_skills(missing: list[str]) -> str:
+def format_missing_skills(missing: list[str], disabled: list[str] | None = None) -> str:
     """One error line for unresolved preload identifiers: ambiguous ones keep their own wording,
-    the rest are reported as ``Unknown skill(s): ...``."""
+    the rest are reported as ``Unknown skill(s): ...``.
+
+    *disabled* holds the names the operator switched off. Callers that load with ``disabled_as_missing``
+    fold them into *missing* (so the skill still isn't force-loaded), so they are subtracted from the
+    unknown clause and reported as ``Disabled skill(s): ...`` instead — a present-but-disabled skill
+    is never "unknown", and both facts share one line so either wording stays greppable.
+    """
+    disabled_names = [name for name in (disabled or []) if name]
+    disabled_set = set(disabled_names)
     ambiguous = [m for m in missing if m.startswith(AMBIGUOUS_SKILL_PREFIX)]
-    unknown = [m for m in missing if m not in ambiguous]
-    return "; ".join(ambiguous + ([f"Unknown skill(s): {', '.join(unknown)}"] if unknown else []))
+    unknown = [m for m in missing if m not in ambiguous and m not in disabled_set]
+    return "; ".join(ambiguous
+                     + ([f"Unknown skill(s): {', '.join(unknown)}"] if unknown else [])
+                     + ([f"Disabled skill(s): {', '.join(disabled_names)}"] if disabled_names else []))
 
 
 def _inject_skill_config(loaded_skill: dict[str, Any], parts: list[str]) -> None:
@@ -783,6 +793,40 @@ def _disabled_skill_names(platform: str | None = None) -> set:
         return set()
 
 
+def _names_disabled(disabled_names: set, *candidates: str) -> bool:
+    """True when any *candidate* name is operator-disabled, matching ``_is_skill_disabled``'s aliases.
+
+    Mirrors the three forms the old inline check accepted: the declared name, the raw identifier, and
+    the segment after a ``tier:name`` separator.
+
+    A pinned absolute path normalizes to ``<name>/SKILL.md`` (see ``normalize_skill_lookup_name``), which
+    is still not the disabled key, so the owning directory name is compared too. Without that, ``hermes -s
+    /abs/path/to/<disabled-skill>/SKILL.md`` reported "Unknown skill(s)" for a skill present on disk.
+    """
+    names = set()
+    for value in candidates:
+        if not value:
+            continue
+        names.add(value)
+        # A pinned absolute path resolves to the relative form skill_view() accepts; compare both so the
+        # pre-load gate agrees with the loader it is standing in for.
+        try:
+            from agent.skill_utils import normalize_skill_lookup_name
+            normalized = normalize_skill_lookup_name(value)
+        except Exception:
+            normalized = value
+        if normalized:
+            names.add(normalized)
+        if ":" in value:
+            names.add(value.split(":", 1)[1])
+        # ``<name>/SKILL.md`` and ``<tier>/<name>/SKILL.md`` both carry the disabled key in a parent
+        # segment; skill_view() resolves those to the same skill, so compare them here too.
+        for segment in (normalized or value).replace("\\", "/").split("/"):
+            if segment and segment not in (".", "..", "SKILL.md"):
+                names.add(segment)
+    return bool(names & disabled_names)
+
+
 def _load_skill_blocks(
     identifiers: list[str], load, activation_note, task_id: str | None, *,
     missing_label=lambda ident: ident, disabled_names: set | None = None, disabled_as_missing: bool = False,
@@ -803,17 +847,31 @@ def _load_skill_blocks(
         if not identifier or identifier in seen:
             continue
         seen.add(identifier)
+        # The disabled gate runs BEFORE load(), never after. ``skill_view()`` refuses an
+        # operator-disabled skill outright (tools/skills_tool.py), so ``load()`` returns None and the
+        # old post-load check could only ever run for a skill that had already loaded — i.e. never for
+        # a disabled one. Testing after the load therefore never fired in production: the pin landed
+        # in *missing* as "Unknown skill(s)" and *disabled* stayed empty, which is exactly the fleet
+        # failure this closes. Resolve the name here, off the identifier, and never read the body.
+        if disabled_names and _names_disabled(disabled_names, identifier):
+            # ``disabled_as_missing`` (preload / auto_load) also reports the name in *missing*, since the
+            # skill must not be force-loaded there. Record the exact identifier so
+            # format_missing_skills subtracts it from the unknown clause instead of lying.
+            disabled.append(identifier)
+            if disabled_as_missing:
+                missing.append(identifier)
+            continue
         loaded = load(identifier)
         if not loaded:
             missing.append(missing_label(identifier))
             continue
         skill_name = loaded[2]
-        if disabled_names and (skill_name in disabled_names or identifier in disabled_names
-                               or (":" in skill_name and skill_name.split(":", 1)[1] in disabled_names)):
+        if disabled_names and _names_disabled(disabled_names, skill_name or identifier):
+            # Reached when the skill body DID load but the canonical name is disabled (a duplicate tier
+            # the scan did not filter). Keep the canonical name for the bundle path (flag off).
+            disabled.append(identifier if disabled_as_missing else (skill_name or identifier))
             if disabled_as_missing:
                 missing.append(identifier)
-            else:
-                disabled.append(skill_name or identifier)
             continue
         if already_loaded and skill_name in already_loaded:
             loaded_names.append(skill_name)
@@ -825,6 +883,7 @@ def _load_skill_blocks(
 
 def build_preloaded_skills_prompt(
     skill_identifiers: list[str], task_id: str | None = None, excluded_loaded_names: set[str] | None = None,
+    disabled_out: list[str] | None = None,
 ) -> tuple[str, list[str], list[str]]:
     """Load skills for session-wide CLI/TUI preloading; returns (prompt_text,
     loaded_skill_names, missing_identifiers). Disabled skills count as missing:
@@ -836,8 +895,12 @@ def build_preloaded_skills_prompt(
     Disabled skills are treated the same as missing ones: this loads via a raw identifier straight into
     ``_load_skill_payload``, bypassing ``get_skill_commands()``'s scan-time disabled filter — mirrors the
     bundle-invocation gate (#59156).
+
+    *disabled_out*, when given, is appended to with the disabled names that were folded into the
+    returned *missing* list, so callers can report "Disabled skill(s)" rather than "Unknown skill(s)".
+    The return arity stays three so every existing caller keeps working.
     """
-    loaded_names, missing, _disabled, prompt_parts = _load_skill_blocks(
+    loaded_names, missing, disabled, prompt_parts = _load_skill_blocks(
         [(raw or "").strip() for raw in skill_identifiers],
         lambda identifier: _load_skill_payload(identifier, task_id=task_id),
         lambda name: (f'[IMPORTANT: The user launched this CLI session with the "{name}" skill '
@@ -846,6 +909,8 @@ def build_preloaded_skills_prompt(
         task_id, missing_label=_missing_skill_label, disabled_names=_disabled_skill_names(),
         disabled_as_missing=True, already_loaded=excluded_loaded_names,
     )
+    if disabled_out is not None:
+        disabled_out.extend(disabled)
     return "\n\n".join(prompt_parts), loaded_names, missing
 
 
@@ -868,6 +933,7 @@ def resolve_auto_load_skills(user_config: dict | None = None) -> list[str]:
 
 def build_auto_load_prompt(
     task_id: str | None = None, user_config: dict | None = None, home_override: Path | None = None,
+    disabled_out: list[str] | None = None,
 ) -> tuple[str, list[str], list[str]]:
     """Render ``skills.auto_load`` as fully loaded skill blocks for a new session; returns
     ``(prompt_text, loaded_names, missing)``. Missing and operator-disabled names are reported,
@@ -876,6 +942,9 @@ def build_auto_load_prompt(
     *home_override* makes home resolution EXPLICIT (same seam as ``build_skills_system_prompt``): the config,
     the disabled list and the ``<home>/skills`` lookup all resolve under that home, so a gateway build thread
     that lost the HERMES_HOME ContextVar cannot pin the launch profile's skills into another profile's prompt.
+
+    *disabled_out*, when given, is appended to with the operator-disabled names folded into *missing*
+    (same role as in ``build_preloaded_skills_prompt``); the return arity stays three.
     """
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
     home_token = set_hermes_home_override(str(home_override)) if home_override is not None else None
@@ -883,7 +952,7 @@ def build_auto_load_prompt(
         auto_skills = resolve_auto_load_skills(user_config)
         if not auto_skills:
             return "", [], []
-        loaded_names, missing, _disabled, prompt_parts = _load_skill_blocks(
+        loaded_names, missing, disabled, prompt_parts = _load_skill_blocks(
             auto_skills,
             lambda identifier: _load_skill_payload(identifier, task_id=task_id),
             lambda name: (f'[IMPORTANT: The "{name}" skill is auto-loaded via config (skills.auto_load). '
@@ -891,6 +960,8 @@ def build_auto_load_prompt(
                           "the user overrides them.]"),
             task_id, disabled_names=_disabled_skill_names(), disabled_as_missing=True,
         )
+        if disabled_out is not None:
+            disabled_out.extend(disabled)
         return "\n\n".join(prompt_parts), loaded_names, missing
     finally:
         if home_token is not None:

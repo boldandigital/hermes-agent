@@ -416,9 +416,11 @@ class CLIInitMixin:
         # skills.auto_load rendered in the preload thread; None until joined. Handed to every
         # agent this CLI builds so the prompt bytes never depend on when the agent was created.
         self._auto_load_skills_result: Optional[tuple] = None
+        self._auto_load_skills_disabled: Optional[list] = None
         # Background --skills preload, joined by finalize_preloaded_skills before any agent is built.
         self._preload_skills_thread: Optional[threading.Thread] = None
         self._preload_skills_result: Optional[tuple] = None
+        self._preload_skills_disabled: Optional[list] = None
         self._preload_skills_error: Optional[BaseException] = None
         self._preload_skills_requested: list = []
         self._preload_skills_finalized = False

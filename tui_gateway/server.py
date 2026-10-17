@@ -2617,12 +2617,14 @@ def _startup_system_prompt(cfg: dict, task_id: str) -> str:
     if not startup_skills:
         return system_prompt
     from agent.skill_commands import build_preloaded_skills_prompt, format_missing_skills
-    skills_prompt, loaded_skills, missing_skills = build_preloaded_skills_prompt(startup_skills, task_id=task_id)
+    disabled: list[str] = []  # operator-disabled names, reported apart from genuinely unknown ones
+    skills_prompt, loaded_skills, missing_skills = build_preloaded_skills_prompt(
+        startup_skills, task_id=task_id, disabled_out=disabled)
     if missing_skills:
         if not loaded_skills:
-            raise ValueError(format_missing_skills(missing_skills))
+            raise ValueError(format_missing_skills(missing_skills, disabled))
         logger.warning("Skipping %s. Continuing with: %s. List available skills with `hermes skills list`.",
-                       format_missing_skills(missing_skills), ", ".join(loaded_skills))
+                       format_missing_skills(missing_skills, disabled), ", ".join(loaded_skills))
     if skills_prompt:
         system_prompt = "\n\n".join(part for part in (system_prompt, skills_prompt) if part).strip()
     return system_prompt

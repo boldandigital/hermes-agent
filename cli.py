@@ -1018,7 +1018,9 @@ class HermesCLI(CLIInitMixin, CLITuiRuntimeMixin, CLIProcessNotificationsMixin, 
             raise err
         auto_result = getattr(self, "_auto_load_skills_result", None)
         if auto_result and auto_result[2]:
-            logger.warning("skills.auto_load: skill(s) not found or disabled, skipped: %s", ", ".join(auto_result[2]))
+            from agent.skill_commands import format_missing_skills
+            logger.warning("skills.auto_load: skill(s) not found or disabled, skipped: %s", format_missing_skills(
+                auto_result[2], getattr(self, "_auto_load_skills_disabled", None)))
         # auto_load names first, then explicit -s names that were not already pinned.
         self.preloaded_skills = list(auto_result[1]) if auto_result else []
         result = getattr(self, "_preload_skills_result", None)
@@ -1027,11 +1029,13 @@ class HermesCLI(CLIInitMixin, CLITuiRuntimeMixin, CLIProcessNotificationsMixin, 
         skills_prompt, loaded_skills, missing_skills = result
         if missing_skills:
             from agent.skill_commands import format_missing_skills
+            # A skill the operator disabled is reported as disabled, not unknown (it is on disk).
+            disabled_skills = getattr(self, "_preload_skills_disabled", None)
             # A typo'd name must not crash a kanban worker; only a fully-missing set fails loudly.
             if not loaded_skills:
-                raise ValueError(format_missing_skills(missing_skills))
+                raise ValueError(format_missing_skills(missing_skills, disabled_skills))
             logger.warning("Skipping %s. Continuing with: %s. List available skills with `hermes skills list`.",
-                           format_missing_skills(missing_skills), ", ".join(loaded_skills))
+                           format_missing_skills(missing_skills, disabled_skills), ", ".join(loaded_skills))
         if skills_prompt:
             self.system_prompt = "\n\n".join(p for p in (self.system_prompt, skills_prompt) if p).strip()
         self.preloaded_skills += [name for name in loaded_skills if name not in self.preloaded_skills]
@@ -1506,6 +1510,29 @@ class HermesCLI(CLIInitMixin, CLITuiRuntimeMixin, CLIProcessNotificationsMixin, 
             relaunch(self._pending_relaunch, preserve_inherited=False)
 
 
+def _call_collecting_disabled(builder, *args, disabled_out: list[str], **kwargs):
+    """Call a skill-preload *builder*, asking it to report the operator-disabled names it skipped.
+
+    ``disabled_out`` only reaches builders that declare it (``build_preloaded_skills_prompt`` and
+    ``build_auto_load_prompt``, plus any ``**kwargs`` wrapper such as ``_lazy_shim``). A callable pinned
+    to the signature from before that parameter existed — a test double, in practice — is called without
+    it, so the preload falls back to today's plain "Unknown skill(s)" message instead of raising
+    ``TypeError`` inside the background thread.
+    """
+    import inspect
+
+    try:
+        params = inspect.signature(builder).parameters
+        collects = "disabled_out" in params or any(
+            param.kind is inspect.Parameter.VAR_KEYWORD for param in params.values()
+        )
+    except (TypeError, ValueError):  # uninspectable callable — keep the pre-existing call shape
+        collects = False
+    if collects:
+        kwargs["disabled_out"] = disabled_out
+    return builder(*args, **kwargs)
+
+
 def _build_cli_from_args(model, toolsets, provider, reasoning, api_key, base_url, max_turns, run_budget, verbose, compact, resume, checkpoints, pass_session_id, ignore_rules, skills):
     """Resolve the toolset list (explicit / coding posture / platform default), construct HermesCLI, and start the background skills preload."""
     toolsets_list = None
@@ -1567,14 +1594,25 @@ def _build_cli_from_args(model, toolsets, provider, reasoning, api_key, base_url
         # at agent init, not by the banner. finalize_preloaded_skills() joins the
         # thread before any consumer reads cli.system_prompt.
         def _load_preloaded_skills() -> None:
+            auto_disabled: list[str] = []
+            preload_disabled: list[str] = []
             try:
                 if auto_load_names:
-                    cli._auto_load_skills_result = build_auto_load_prompt(task_id=cli.session_id, user_config=CLI_CONFIG)
+                    cli._auto_load_skills_result = _call_collecting_disabled(
+                        build_auto_load_prompt, task_id=cli.session_id, user_config=CLI_CONFIG,
+                        disabled_out=auto_disabled)
                 if parsed_skills:
-                    cli._preload_skills_result = build_preloaded_skills_prompt(
-                        parsed_skills, task_id=cli.session_id, excluded_loaded_names=set(cli._auto_load_skills_result[1]))
+                    cli._preload_skills_result = _call_collecting_disabled(
+                        build_preloaded_skills_prompt, parsed_skills,
+                        task_id=cli.session_id,
+                        excluded_loaded_names=set(cli._auto_load_skills_result[1]),
+                        disabled_out=preload_disabled)
             except Exception as exc:  # surfaced by finalize
                 cli._preload_skills_error = exc
+            # Kept beside the results (never inside them) so the strict 3-way unpack in
+            # finalize_preloaded_skills still holds.
+            cli._auto_load_skills_disabled = auto_disabled
+            cli._preload_skills_disabled = preload_disabled
 
         cli._preload_skills_requested = [*auto_load_names, *(s for s in parsed_skills if s not in auto_load_names)]
         cli._preload_skills_thread = threading.Thread(target=_load_preloaded_skills, name="skills-preload", daemon=True)

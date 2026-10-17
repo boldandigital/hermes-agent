@@ -44,3 +44,18 @@ class TestBuildPreloadedSkillsPrompt:
             lambda parsed, **kw: ("PROMPT", ["good"], ["bad"]),
         )
         assert _build_preloaded_skills_prompt(["good", "bad"]) == "PROMPT"
+
+    def test_disabled_skill_raises_as_disabled_not_unknown(self, monkeypatch):
+        """-z/-s with an operator-disabled pin: the skill exists, so the error must not claim unknown."""
+        import agent.skill_commands as sc
+
+        def fake_preload(parsed, **kw):
+            if kw.get("disabled_out") is not None:
+                kw["disabled_out"].append("disabled-skill")
+            return "", [], ["disabled-skill"]
+
+        monkeypatch.setattr(sc, "build_preloaded_skills_prompt", fake_preload)
+
+        with pytest.raises(ValueError, match=r"Disabled skill\(s\): disabled-skill") as excinfo:
+            _build_preloaded_skills_prompt("disabled-skill")
+        assert "Unknown skill" not in str(excinfo.value)
