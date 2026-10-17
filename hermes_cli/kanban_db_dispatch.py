@@ -2019,6 +2019,46 @@ def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -
         return spawn_fn(task, workspace)
 
 
+def _validate_worker_skills(
+    conn: sqlite3.Connection, claimed: Task, *, failure_limit: int,
+) -> bool:
+    """True when *claimed*'s pinned skills can all be loaded from its own assignee's seat.
+
+    This is the layer that owns the fleet-wide ``Unknown skill(s): sdlc-review`` incident: the
+    dispatcher force-injects that name on the review lane, so a seat that has it under
+    ``skills.disabled`` spawned a worker that died at ``Initializing agent...`` — before reading the
+    card, and identically on every retry. Nothing on the card was ever at fault; the card had no
+    ``skills`` at all.
+
+    Records a normal spawn failure when the verdict is negative (releasing the claim and closing the
+    run, exactly like a workspace or spawn error) so the operator sees WHICH skill and WHICH seat,
+    and so the breaker eventually parks the card instead of spinning it forever. A scan that cannot
+    run returns True: an unreadable config must not strand a healthy card.
+    """
+    skills = list(claimed.skills or [])
+    if not skills or not claimed.assignee:
+        return True
+    try:
+        from hermes_cli import kanban_skill_guard as _guard
+        seat_home = _guard.resolve_seat_home(claimed.assignee)
+        verdict = _guard.unresolvable_skills(skills, seat_home=seat_home)
+    except Exception as exc:  # never let the guard itself break a dispatch tick
+        _kb._log.debug("kanban dispatcher: skill preflight skipped for %s (%s)", claimed.id, exc)
+        return True
+    if verdict is None:
+        return True
+    disabled, unknown = verdict
+    message = _guard.format_unresolvable(disabled, unknown, seat=claimed.assignee)
+    if not message:
+        return True
+    _kb._log.warning("kanban dispatcher: refusing to spawn %s — %s", claimed.id, message)
+    _record_task_failure(
+        conn, claimed.id, message,
+        outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
+    )
+    return False
+
+
 def _dispatch_lane_task(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
@@ -2117,6 +2157,12 @@ def _dispatch_lane_task(
         # Force-load sdlc-review; the kanban lifecycle is already in every
         # worker's system prompt via KANBAN_GUIDANCE.
         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
+    # Validate the ASSEMBLED set — after the injection above, so this covers the skill the
+    # dispatcher forces on itself as well as any the card pinned. A name that will not load in the
+    # claiming seat kills the worker at "Initializing agent..." before it reads the card, and burns
+    # every retry on the same verdict; refuse here instead, naming the skill and the seat.
+    if not _validate_worker_skills(conn, claimed, failure_limit=failure_limit):
+        return False
     try:
         pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
         if pid:

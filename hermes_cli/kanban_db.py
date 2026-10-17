@@ -1181,6 +1181,39 @@ def _normalize_task_skills(skills: Optional[Iterable[str]]) -> Optional[list[str
     return cleaned
 
 
+def _validate_task_skills(
+    skills: Optional[Iterable[str]], assignee: Optional[str],
+) -> None:
+    """Raise ValueError when a pinned skill cannot be loaded from the ASSIGNEE's own seat.
+
+    ``skills.disabled`` is per-profile, so a pin that resolves for the creator can be off (or
+    absent) for the assignee — and the worker then dies at ``Initializing agent...``, before it ever
+    reads the card. Failing here names the seat while the operator is still looking at the create
+    call.
+
+    Scoped to *assignee*, never the creator: the creator's ability to resolve a name says nothing
+    about the seat that will run the work. Unassigned cards and seats that cannot be resolved are
+    skipped outright, and a scan that cannot run degrades to a no-op — this is a guard rail, not a
+    gate. Resolution itself is delegated to ``kanban_skill_guard`` so this check and the
+    dispatch-time check can never disagree with the loader.
+
+    The dispatcher runs its own check on the fully-assembled skill set (see
+    ``kanban_db_dispatch``), which additionally covers the ``sdlc-review`` it injects itself on the
+    review lane. This function guards genuine operator pins only.
+    """
+    if not skills:
+        return
+    from hermes_cli import kanban_skill_guard as _guard
+    seat_home = _guard.resolve_seat_home(assignee)
+    verdict = _guard.unresolvable_skills(skills, seat_home=seat_home)
+    if verdict is None:
+        return  # no seat, or the scan could not run — carry on.
+    disabled, unknown = verdict
+    message = _guard.format_unresolvable(disabled, unknown, seat=assignee)
+    if message:
+        raise ValueError(message)
+
+
 def create_task(
     conn: sqlite3.Connection, *, title: str, body: Optional[str] = None,
     assignee: Optional[str] = None, created_by: Optional[str] = None,
@@ -1248,6 +1281,7 @@ def create_task(
     )
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
+    _validate_task_skills(skills_list, assignee)
 
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
     # race may insert twice, the next lookup stabilises on the newest.
