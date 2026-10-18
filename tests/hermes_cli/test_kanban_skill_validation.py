@@ -237,6 +237,83 @@ def test_create_accepts_plugin_served_colon_form_that_resolves(seats, board, mon
             "the plugin registry serves mem:recall; the guard must not convict it")
 
 
+def test_create_accepts_absolute_path_pin_the_loader_normalizes(seats, board):
+    """AC4 regression: an ABSOLUTE PATH pin loads, so the guard must not convict it.
+
+    ``_load_skill_payload`` normalizes the identifier FIRST
+    (``agent/skill_commands.py``: ``normalized = normalize_skill_lookup_name(raw_identifier)``),
+    and ``normalize_skill_lookup_name`` exists precisely to translate a trusted absolute skill
+    path — the form slash commands and cron store — into the relative spelling ``skill_view``
+    accepts. The guard mirrored the check that FOLLOWS that normalization
+    (``_skill_lookup_path_error``) without mirroring the normalization itself, so it convicted a
+    pin the worker loads fine. That is AC4 violated, and it is a REGRESSION: the round-1 guard had
+    no pre-flight at all and answered "fine" for this same pin.
+
+    It matters more than the blast radius suggests (0 of 148 live cards use this form): the
+    dispatch layer does not merely refuse. ``_validate_worker_skills`` calls
+    ``_record_task_failure(outcome="spawn_failed")``, so the first genuinely-abs-path card parks
+    itself in ``blocked`` carrying a false "Unknown skill(s)" in ``last_failure_error`` — an
+    unfalsifiable lie about a healthy pin, produced by the very layer meant to keep the fleet from
+    being stranded by bad pins.
+    """
+    skill_dir = _write_skill(seats["alpha"] / "skills", "arxiv", category="research")
+
+    # Ground truth FIRST: the worker's own loader is the reference. If it cannot load this pin,
+    # the assertion below would prove nothing (a broken fixture reads like a guard defect).
+    from agent.skill_commands import _load_skill_payload
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    token = set_hermes_home_override(str(seats["alpha"]))
+    try:
+        assert _load_skill_payload(str(skill_dir)), (
+            "fixture is wrong, not the guard: the loader must load the absolute-path pin")
+    finally:
+        reset_hermes_home_override(token)
+
+    with kbc.connect(board) as conn:
+        assert kb.create_task(conn, title="t", assignee="alpha", skills=[str(skill_dir)]), (
+            "the loader normalizes this absolute path and loads it; refusing violates AC4 and, at "
+            "dispatch, parks a healthy card in `blocked` with a false 'Unknown skill(s)'")
+
+
+def test_create_rejects_pins_that_only_the_path_preflight_convicts(seats, board):
+    """The pre-flight is load-bearing: normalizing must not become a licence to load anything.
+
+    Measured by neutering ``_skill_lookup_path_error`` and diffing verdicts, these two pins are
+    the ones it decides ALONE — without it the guard answers "fine" for both while the worker's
+    loader refuses them. Both are FALSE NEGATIVES (a missed check), which is the direction this
+    guard is happy to fail in; the point of the test is that removing the pre-flight is not a
+    silent no-op, so a future refactor that drops it gets caught rather than shipped.
+
+    * ``../skills/inside-skill`` — a traversal that resolves *back inside* the trusted root. The
+      flat-tree scan would happily find the skill; only the path check refuses it.
+    * ``/etc/passwd`` — an absolute path outside every trusted root. ``normalize_skill_lookup_name``
+      passes it through unchanged (its own docstring: "skill_view will reject it"), and
+      ``_locate_skill`` cannot even join it (``rglob`` rejects non-relative patterns), so without
+      the pre-flight the name drops out of both lists and reads as fine.
+    """
+    skill_dir = _write_skill(seats["alpha"] / "skills", "inside-skill")
+
+    # Ground truth FIRST, per pin: the loader refuses both, so the guard must too.
+    from agent.skill_commands import _load_skill_payload
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    token = set_hermes_home_override(str(seats["alpha"]))
+    try:
+        assert not _load_skill_payload("../skills/inside-skill"), (
+            "fixture is wrong: the loader must refuse a traversal that re-enters the root")
+        assert not _load_skill_payload("/etc/passwd"), (
+            "fixture is wrong: the loader must refuse an absolute path outside the trusted roots")
+        # And the traversal really does resolve back inside the root — otherwise it would be
+        # caught by the scan finding nothing, and the pre-flight would not be what convicts it.
+        assert (skill_dir / "SKILL.md").exists()
+    finally:
+        reset_hermes_home_override(token)
+
+    for pin in ("../skills/inside-skill", "/etc/passwd"):
+        with kbc.connect(board) as conn, pytest.raises(ValueError) as exc:
+            kb.create_task(conn, title="t", assignee="alpha", skills=[pin])
+        assert pin in str(exc.value), f"the message must name the pin as given: {pin}"
+
+
 def test_create_rejects_colon_form_the_registry_refuses(seats, board, monkeypatch, tmp_path):
     """The registry's NO counts too — ``served is not None`` is not the same as "resolved".
 

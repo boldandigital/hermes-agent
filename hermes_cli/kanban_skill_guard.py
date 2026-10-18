@@ -15,7 +15,14 @@ by the SAME machinery the loader uses:
   reads a body, so ambiguity, shadowing and cross-tier ties answer identically here and at load;
 * the disabled gate — :func:`agent.skill_commands._names_disabled` against
   :func:`agent.skill_utils.get_disabled_skill_names`, the pre-load gate in
-  ``agent.skill_commands._load_skill_blocks``, checked BEFORE resolution exactly as the loader does.
+  ``agent.skill_commands._load_skill_blocks``, checked BEFORE resolution exactly as the loader does;
+* identifier normalization — :func:`agent.skill_utils.normalize_skill_lookup_name`, which
+  ``_load_skill_payload`` applies to the raw pin BEFORE calling ``skill_view``. It is what turns a
+  trusted absolute skill path into the relative spelling the lookup accepts, so mirroring the
+  pre-flight WITHOUT it would convict a pin the worker loads fine.
+
+The mirrored steps run on the normalized spelling; operator-facing messages keep the ORIGINAL pin,
+because that is the string on the card.
 
 Deliberately NOT used: ``skill_view`` / ``build_preloaded_skills_prompt``. They read the full body,
 mark the skill read, and run ``pm.ensure`` for declared tool deps — a validator must have no side
@@ -128,6 +135,25 @@ def _served_ok(served: str) -> bool:
         return True
 
 
+def _normalized_lookup(name: str) -> str:
+    """The spelling ``skill_view`` is actually called with, exactly as ``_load_skill_payload`` gets it.
+
+    ``_load_skill_payload`` (``agent/skill_commands.py``) does ``normalize_skill_lookup_name(raw)``
+    FIRST and hands only the result to ``skill_view``. That normalization is what turns a trusted
+    ABSOLUTE skill path — the form slash commands and cron store — into the relative spelling the
+    lookup path pre-flight accepts. A guard that mirrors the pre-flight without mirroring the
+    normalization convicts a pin the worker loads fine.
+
+    Falls back to *name* on any failure: the pre-flight downstream still gets its say, so a
+    normalization that cannot answer degrades to "no extra information", never to a conviction.
+    """
+    try:
+        from agent.skill_utils import normalize_skill_lookup_name
+        return normalize_skill_lookup_name(name) or name
+    except Exception:
+        return name
+
+
 def _classify(names: list[str]) -> tuple[list[str], list[str]]:
     """(disabled, unknown) for *names* under the currently-bound home."""
     from agent.skill_commands import _names_disabled
@@ -146,13 +172,19 @@ def _classify(names: list[str]) -> tuple[list[str], list[str]]:
     unknown: list[str] = []
     for name in names:
         # Order matches _load_skill_blocks: the disabled gate runs BEFORE load, never after.
+        # The disabled gate takes the ORIGINAL identifier — _names_disabled normalizes internally
+        # for exactly this reason (its docstring cites the absolute-path pin).
         if _names_disabled(disabled_names, name):
             disabled.append(name)
             continue
         try:
-            # Same pre-flight skill_view runs, so a name the loader would refuse on sight
-            # (traversal, absolute path) is not "resolved" here either.
-            if _skill_lookup_path_error(name):
+            # Resolution runs on the NORMALIZED spelling, because that is what _load_skill_payload
+            # hands skill_view. Every step below therefore sees the same string the loader sees.
+            # Messages keep the ORIGINAL pin — that is what the operator wrote on the card.
+            lookup = _normalized_lookup(name)
+            # Same pre-flight skill_view runs, so a name the loader refuses on sight (traversal,
+            # absolute path outside every trusted root) is not "resolved" here either.
+            if _skill_lookup_path_error(lookup):
                 unknown.append(name)
                 continue
             # Mirrors skill_view's ':' dispatch. A ':' name is answered by the plugin registry
@@ -162,8 +194,8 @@ def _classify(names: list[str]) -> tuple[list[str], list[str]]:
             # spelling of a live skill scanned as nothing and was reported "Unknown" — a false
             # positive that, at dispatch, parks a healthy card and burns the breaker.
             local_category_name: str | None = None
-            if ":" in name:
-                served, local_category_name = _resolve_plugin_skill(name, None, None, False)
+            if ":" in lookup:
+                served, local_category_name = _resolve_plugin_skill(lookup, None, None, False)
                 if served is not None:
                     # The registry answered definitively; the loader never falls through to disk.
                     if not _served_ok(served):
@@ -172,7 +204,7 @@ def _classify(names: list[str]) -> tuple[list[str], list[str]]:
                 if local_category_name and _skill_lookup_path_error(local_category_name):
                     unknown.append(name)
                     continue
-            error, _skill_dir, skill_md = _locate_skill(name, local_category_name, roots)
+            error, _skill_dir, skill_md = _locate_skill(lookup, local_category_name, roots)
             if error is not None or skill_md is None:
                 unknown.append(name)
         except Exception:
