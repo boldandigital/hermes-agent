@@ -1814,6 +1814,46 @@ MEMORY_GUARD_MB_PER_WORKER = 512
 DERIVED_MAX_IN_PROGRESS_FLOOR = 2
 DERIVED_MAX_IN_PROGRESS_CEILING = 8
 
+# Warn-once latch for the inert derived cap — see _warn_inert_max_in_progress.
+_INERT_MAX_IN_PROGRESS_WARNED: set = set()
+
+
+def _warn_inert_max_in_progress(sample: Any) -> None:
+    """Announce ONCE per process that the derived concurrency cap is INERT.
+
+    A ``None`` from :func:`derive_default_max_in_progress` is ambiguous: it can
+    mean "no memory problem" or "cannot see the host's memory". A silent ``None``
+    reads as the former while behaving as the latter — with no derived cap the
+    memory-pressure guard also reports ``"unknown"`` and imposes no restriction,
+    so an unset ``kanban.max_in_progress`` leaves dispatch effectively UNCAPPED.
+
+    Both an ABSENT sample (``{}`` — ``sample_memory`` parses Linux ``/proc``
+    only, so non-Linux hosts see ``{}``) and a MALFORMED ``mem_total_kib``
+    reach this path, and the platform is not the cause in the latter case. The
+    message therefore reports the observed sample keys rather than asserting a
+    cause, so one honest warning covers both.
+
+    Warn-once is load-bearing, not decoration: ``run_daemon`` re-resolves the
+    derived cap EVERY tick, so an unguarded warning repeats forever.
+    """
+    if "inert_max_in_progress" in _INERT_MAX_IN_PROGRESS_WARNED:
+        return
+    _INERT_MAX_IN_PROGRESS_WARNED.add("inert_max_in_progress")
+    try:
+        observed = ", ".join(sorted(str(k) for k in dict(sample))) or "none"
+    except Exception:
+        observed = "unreadable"
+    _kb._log.warning(
+        "kanban dispatch: memory-derived max_in_progress is INERT — no usable "
+        "system memory sample (observed keys: %s; sys.platform=%r) — so with "
+        "kanban.max_in_progress unset there is NO concurrency cap, and the "
+        "memory-pressure guard likewise reports 'unknown' (no restriction). "
+        "Set kanban.max_in_progress explicitly to bound dispatch. (Warned once "
+        "per process.)",
+        observed,
+        sys.platform,
+    )
+
 
 def _system_memory_sample() -> dict:
     """Best-effort system memory snapshot (KiB values), ``{}`` when unknown.
@@ -1833,12 +1873,14 @@ def derive_default_max_in_progress(sample: Optional[Mapping[str, Any]] = None) -
     """Memory-derived default for ``kanban.max_in_progress`` when unset:
     ``clamp(MemTotal / MEMORY_GUARD_MB_PER_WORKER, FLOOR, CEILING)``. Returns
     ``None`` (no cap) when total memory is unknown, so macOS/Windows dev
-    machines are unaffected.
+    machines are unaffected. That inert return is announced once per process by
+    :func:`_warn_inert_max_in_progress` — fail-open is safe, fail-silent is not.
     """
     if sample is None:
         sample = _system_memory_sample()
     total_kib = sample.get("mem_total_kib")
     if isinstance(total_kib, bool) or not isinstance(total_kib, int) or total_kib <= 0:
+        _warn_inert_max_in_progress(sample)
         return None
     workers = (total_kib // 1024) // MEMORY_GUARD_MB_PER_WORKER
     return max(DERIVED_MAX_IN_PROGRESS_FLOOR, min(workers, DERIVED_MAX_IN_PROGRESS_CEILING))

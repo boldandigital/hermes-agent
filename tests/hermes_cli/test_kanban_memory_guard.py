@@ -17,6 +17,7 @@ Covers the two safeguards added in response:
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -238,3 +239,131 @@ def test_dispatch_critical_pressure_still_runs_reclaim_bookkeeping(
     assert res.memory_pressure == "critical"
     assert row is not None
     assert row.status == "ready"
+
+
+# ---------------------------------------------------------------------------
+# Inert-cap warning (fail-open must not be fail-silent)
+# ---------------------------------------------------------------------------
+
+# Substring every inert-cap warning contains, so the latch tests do not depend
+# on the exact wording.
+_INERT_MARKER = "INERT"
+
+
+@pytest.fixture
+def unlatched(monkeypatch):
+    """Clear the warn-once latch.
+
+    ``tests/conftest.py`` autouse-patches ``_system_memory_sample`` to ``dict``,
+    so the inert path is already live in most tests in this suite and the latch
+    is already set for the whole session. Resetting it here keeps the
+    warning-assertion tests independent of test ordering.
+    """
+    monkeypatch.setattr(kbd, "_INERT_MAX_IN_PROGRESS_WARNED", set())
+    return kbd._INERT_MAX_IN_PROGRESS_WARNED
+
+
+def _inert_records(caplog):
+    return [r for r in caplog.records if _INERT_MARKER in r.getMessage()]
+
+
+def test_inert_cap_warns_exactly_once(unlatched, monkeypatch, caplog):
+    """The latch has teeth: the first inert resolve warns, the second is silent.
+
+    ``run_daemon`` re-resolves the derived cap every tick, so a warning that
+    repeated per tick would be permanent log noise.
+    """
+    monkeypatch.setattr(kbd, "_system_memory_sample", dict)
+    with caplog.at_level("WARNING"):
+        assert kbd.resolve_max_in_progress(None) is None
+        assert len(_inert_records(caplog)) == 1
+
+        # Second call on the SAME process must not re-warn.
+        assert kbd.resolve_max_in_progress(None) is None
+        assert kbd.resolve_max_in_progress(None) is None
+    assert len(_inert_records(caplog)) == 1
+
+
+def test_inert_cap_warning_names_the_remedy(unlatched, monkeypatch, caplog):
+    """The warning must be actionable: say it is uncapped and name the fix."""
+    monkeypatch.setattr(kbd, "_system_memory_sample", dict)
+    with caplog.at_level("WARNING"):
+        kbd.derive_default_max_in_progress()
+    msg = _inert_records(caplog)[0].getMessage()
+    # Uncapped, the pressure guard is inert too, and the remedy is explicit.
+    assert "NO concurrency cap" in msg
+    assert "unknown" in msg
+    assert "kanban.max_in_progress" in msg
+    assert repr(sys.platform) in msg
+
+
+def test_inert_cap_warning_reports_sample_keys_not_a_cause(
+    unlatched, monkeypatch, caplog
+):
+    """A malformed sample must not be blamed on the platform.
+
+    ``return None`` is also reached by a non-int ``mem_total_kib``, where
+    ``sys.platform`` is irrelevant — so the message reports the observed keys.
+    """
+    monkeypatch.setattr(kbd, "_system_memory_sample", dict)
+    with caplog.at_level("WARNING"):
+        kbd.derive_default_max_in_progress({"mem_total_kib": True})
+    msg = _inert_records(caplog)[0].getMessage()
+    assert "mem_total_kib" in msg
+    # An absent sample reports no keys at all.
+    unlatched.clear()
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        kbd.derive_default_max_in_progress()
+    assert "none" in _inert_records(caplog)[0].getMessage()
+
+
+def test_valid_sample_does_not_warn(unlatched, monkeypatch, caplog):
+    """Deriving a real cap is not an error state — stay quiet."""
+    monkeypatch.setattr(
+        kbd, "_system_memory_sample", lambda: {"mem_total_kib": 1 * GIB}
+    )
+    with caplog.at_level("WARNING"):
+        assert kbd.resolve_max_in_progress(None) == 2
+    assert _inert_records(caplog) == []
+
+
+def test_inert_cap_latch_is_resettable(unlatched, monkeypatch, caplog):
+    """Tests must not depend on ordering: a fresh latch warns again."""
+    monkeypatch.setattr(kbd, "_system_memory_sample", dict)
+    with caplog.at_level("WARNING"):
+        kbd.derive_default_max_in_progress()
+        assert len(_inert_records(caplog)) == 1
+    # `unlatched` is the very set the module consults; emptying it is the reset.
+    unlatched.clear()
+    with caplog.at_level("WARNING"):
+        kbd.derive_default_max_in_progress()
+        assert len(_inert_records(caplog)) == 2
+
+
+def test_inert_cap_warning_does_not_change_return_values(
+    unlatched, monkeypatch, caplog
+):
+    """The warning is observation only: the value contract is unchanged."""
+    monkeypatch.setattr(kbd, "_system_memory_sample", dict)
+    with caplog.at_level("WARNING"):
+        # No usable sample -> uncapped ...
+        assert kbd.derive_default_max_in_progress({}) is None
+        assert kbd.resolve_max_in_progress(None) is None
+        # ... but an explicit config still wins and warns nothing further.
+        assert kbd.resolve_max_in_progress(2) == 2
+    assert len(_inert_records(caplog)) == 1
+
+
+def test_valid_sample_still_derives_after_warning(unlatched, monkeypatch):
+    """Regression guard: warning must not disturb the arithmetic or the floor."""
+    monkeypatch.setattr(kbd, "_system_memory_sample", dict)
+    assert kbd.derive_default_max_in_progress() is None  # latches the warning
+    monkeypatch.setattr(
+        kbd, "_system_memory_sample", lambda: {"mem_total_kib": 1 * GIB}
+    )
+    assert kbd.derive_default_max_in_progress() == 2
+    assert kbd.derive_default_max_in_progress({"mem_total_kib": GIB // 4}) == 2
+    assert kbd.derive_default_max_in_progress(
+        {"mem_total_kib": 64 * GIB}
+    ) == kbd.DERIVED_MAX_IN_PROGRESS_CEILING
