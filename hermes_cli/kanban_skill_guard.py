@@ -33,6 +33,7 @@ whether an unresolvable pin is fatal.
 from __future__ import annotations
 
 import contextlib
+import json
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -109,11 +110,31 @@ def _seat_config_usable(seat_home: Path) -> bool:
         return False
 
 
+def _served_ok(served: str) -> bool:
+    """Did the plugin registry actually SERVE this name?
+
+    ``_resolve_plugin_skill`` returns the registry's JSON verdict, not a yes/no: it is non-None both
+    when a plugin serves the skill and when the registry refuses it (plugin disabled, stale entry
+    pointing at a deleted file, skill absent from a plugin that exists). Only the former loads, so
+    the guard must read ``success`` rather than treat any non-None answer as resolved — otherwise a
+    genuinely unloadable pin passes as fine.
+
+    An unreadable payload is treated as served: this guard must never convict on a verdict it could
+    not actually read.
+    """
+    try:
+        return bool(json.loads(served).get("success"))
+    except Exception:
+        return True
+
+
 def _classify(names: list[str]) -> tuple[list[str], list[str]]:
     """(disabled, unknown) for *names* under the currently-bound home."""
     from agent.skill_commands import _names_disabled
     from agent.skill_utils import get_disabled_skill_names
-    from tools.skills_tool import _locate_skill, _skill_search_dirs
+    from tools.skills_tool import (
+        _locate_skill, _resolve_plugin_skill, _skill_lookup_path_error, _skill_search_dirs,
+    )
 
     try:
         disabled_names = get_disabled_skill_names()
@@ -129,12 +150,37 @@ def _classify(names: list[str]) -> tuple[list[str], list[str]]:
             disabled.append(name)
             continue
         try:
-            error, _skill_dir, skill_md = _locate_skill(name, None, roots)
+            # Same pre-flight skill_view runs, so a name the loader would refuse on sight
+            # (traversal, absolute path) is not "resolved" here either.
+            if _skill_lookup_path_error(name):
+                unknown.append(name)
+                continue
+            # Mirrors skill_view's ':' dispatch. A ':' name is answered by the plugin registry
+            # FIRST; when no such plugin exists the registry hands back the on-disk `category/skill`
+            # spelling, which the flat-tree scan must also try. Passing that fall-through through is
+            # what keeps this guard agreeing with the loader: without it, the `category:skill`
+            # spelling of a live skill scanned as nothing and was reported "Unknown" — a false
+            # positive that, at dispatch, parks a healthy card and burns the breaker.
+            local_category_name: str | None = None
+            if ":" in name:
+                served, local_category_name = _resolve_plugin_skill(name, None, None, False)
+                if served is not None:
+                    # The registry answered definitively; the loader never falls through to disk.
+                    if not _served_ok(served):
+                        unknown.append(name)
+                    continue
+                if local_category_name and _skill_lookup_path_error(local_category_name):
+                    unknown.append(name)
+                    continue
+            error, _skill_dir, skill_md = _locate_skill(name, local_category_name, roots)
+            if error is not None or skill_md is None:
+                unknown.append(name)
         except Exception:
-            # A resolver blow-up on one name must not condemn the whole set.
+            # A resolver blow-up on one name must not condemn the whole set. LENIENT BY DESIGN:
+            # this drops the name from BOTH lists, so a bad pin reads as "no information" rather
+            # than as a conviction. A missed check is recoverable; a false one is not — it refuses
+            # a card whose skills all load, and at dispatch that parks the card in `blocked`.
             continue
-        if error is not None or skill_md is None:
-            unknown.append(name)
     return disabled, unknown
 
 

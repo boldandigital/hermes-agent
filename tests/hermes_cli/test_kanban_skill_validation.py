@@ -95,6 +95,37 @@ def _disable(home: Path, *names: str) -> None:
         "skills:\n  disabled:\n" + "".join(f"    - {n}\n" for n in names), encoding="utf-8")
 
 
+def _register_plugin_skill(monkeypatch, tmp_path, namespace: str, bare: str) -> Path:
+    """Register ``namespace:bare`` in the plugin registry the way a real plugin does.
+
+    Follows the pattern the repo's own ``tests/tools/test_plugin_skills.py`` uses: a FRESH
+    ``PluginManager`` monkeypatched over the module singleton, with the entry keyed the way a
+    plugin's ``register()`` keys it (``path``/``plugin``/``bare_name``/``description``).
+
+    Mutating the live singleton instead does not survive: ``_resolve_plugin_skill`` calls
+    ``discover_plugins()``, whose scan replaces the registry, so the entry vanished mid-test and
+    the guard and the worker both (correctly) reported the pin as unloadable — a fixture artifact
+    that looked exactly like a guard defect. monkeypatch restores the singleton afterwards, so a
+    registration cannot leak into an unrelated test.
+    """
+    from hermes_cli import plugins as plugins_mod
+    from hermes_cli.plugins import PluginManager
+
+    skill_dir = tmp_path / "plugins" / namespace / "skills" / bare
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    md = skill_dir / "SKILL.md"
+    md.write_text(f"---\nname: {bare}\ndescription: {bare} desc\n---\n\n{bare} body.\n", encoding="utf-8")
+
+    pm = PluginManager()
+    pm._plugin_skills[f"{namespace}:{bare}"] = {
+        "path": md, "plugin": namespace, "bare_name": bare, "description": "",
+    }
+    # _discovered=True: the fixture IS the registry, so the scan must not rescan over it.
+    pm._discovered = True
+    monkeypatch.setattr(plugins_mod, "_plugin_manager", pm)
+    return md
+
+
 def _stage_review(conn, assignee: str) -> str:
     """A card parked in the ``review`` lane — the lane that injects ``sdlc-review``."""
     task_id = kb.create_task(conn, title="review me", assignee=assignee)
@@ -150,6 +181,92 @@ def test_create_reports_every_bad_name_in_one_message(seats, board):
     for name in ("off-skill", "ghost-one", "ghost-two"):
         assert name in message, f"{name} missing from the combined message: {message}"
     assert "kept-skill" not in message, "a resolvable pin must not be reported"
+
+
+def test_create_accepts_namespaced_category_colon_form_that_resolves(
+        seats, board, monkeypatch, tmp_path):
+    """AC4 regression: the ``category:skill`` spelling is the SAME skill, not an unknown one.
+
+    ``skill_view`` dispatches any name containing ``:`` to the plugin registry first, and when no
+    such plugin exists it returns ``(None, "category/skill")`` — a fall-through the flat-tree scan
+    then joins onto each search dir. The guard used to pass ``local_category_name=None``, so it
+    scanned only the literal ``:`` spelling, found nothing, and convicted a skill the worker loads
+    fine. Eight cards already pin this spelling (``research:arxiv``), and the operator's error
+    message said "Unknown" — sending them hunting for a typo that does not exist.
+    """
+    _write_skill(seats["alpha"] / "skills", "arxiv", category="research")
+
+    # Ground truth FIRST: the worker must genuinely load both spellings, or this test proves
+    # nothing. The slash form passing while the colon form failed is what isolated the defect.
+    from agent.skill_commands import _load_skill_payload
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    token = set_hermes_home_override(str(seats["alpha"]))
+    try:
+        assert _load_skill_payload("research/arxiv"), "slash form must load"
+        assert _load_skill_payload("research:arxiv"), (
+            "fixture is wrong, not the guard: the loader must serve the colon form too")
+    finally:
+        reset_hermes_home_override(token)
+
+    with kbc.connect(board) as conn:
+        assert kb.create_task(conn, title="t", assignee="alpha", skills=["research:arxiv"]), (
+            "the loader serves research:arxiv; refusing it violates AC4 and, at dispatch, parks a "
+            "healthy card in `blocked` with a false 'Unknown skill(s)'")
+
+
+def test_create_accepts_plugin_served_colon_form_that_resolves(seats, board, monkeypatch, tmp_path):
+    """AC4 regression: a registry-served ``plugin:skill`` is answered BEFORE ``_locate_skill``.
+
+    The registry never touches the skills tree, so no search-dir scan can find it. Convicting it
+    is the same false positive as the category form, one layer deeper.
+    """
+    _register_plugin_skill(monkeypatch, tmp_path, "mem", "recall")
+
+    # Ground truth FIRST: if the worker's own loader cannot load this pin, the assertion below
+    # would be proving nothing (a broken fixture reads exactly like a guard defect).
+    from agent.skill_commands import _load_skill_payload
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    token = set_hermes_home_override(str(seats["alpha"]))
+    try:
+        assert _load_skill_payload("mem:recall"), "fixture must serve the pin the loader way"
+    finally:
+        reset_hermes_home_override(token)
+
+    with kbc.connect(board) as conn:
+        assert kb.create_task(conn, title="t", assignee="alpha", skills=["mem:recall"]), (
+            "the plugin registry serves mem:recall; the guard must not convict it")
+
+
+def test_create_rejects_colon_form_the_registry_refuses(seats, board, monkeypatch, tmp_path):
+    """The registry's NO counts too — ``served is not None`` is not the same as "resolved".
+
+    ``_resolve_plugin_skill`` returns its JSON verdict for refusals as well as successes (plugin
+    disabled, stale entry whose SKILL.md was deleted, skill absent from a plugin that exists). A
+    guard that treats any non-None answer as resolved passes a pin the loader genuinely cannot
+    load — a missed death, which is the failure this whole guard exists to prevent.
+    """
+    md = _register_plugin_skill(monkeypatch, tmp_path, "mem", "recall")
+    md.unlink()  # the registered SKILL.md is gone: the registry's stale-entry refusal
+
+    from agent.skill_commands import _load_skill_payload
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    token = set_hermes_home_override(str(seats["alpha"]))
+    try:
+        assert not _load_skill_payload("mem:recall"), (
+            "fixture is wrong: the loader must FAIL on a stale registry entry")
+    finally:
+        reset_hermes_home_override(token)
+
+    # The stale-entry refusal is SELF-CLEANING (``_resolve_plugin_skill`` calls
+    # ``remove_plugin_skill``), so that probe above consumed the registry entry. Re-register it, or
+    # the guard finds an empty registry and reports unknown via the DISK scan instead — the test
+    # would still pass, but it would no longer be exercising ``_served_ok`` at all.
+    _register_plugin_skill(monkeypatch, tmp_path, "mem", "recall")
+    (tmp_path / "plugins" / "mem" / "skills" / "recall" / "SKILL.md").unlink()
+
+    with kbc.connect(board) as conn, pytest.raises(ValueError) as exc:
+        kb.create_task(conn, title="t", assignee="alpha", skills=["mem:recall"])
+    assert "mem:recall" in str(exc.value)
 
 
 def test_create_accepts_skills_that_resolve_in_the_assignees_seat(seats, board):
