@@ -33,6 +33,23 @@ The home is bound with ``set_hermes_home_override`` (the seam
 disabled list and the ``<home>/skills`` tree all resolve under the ASSIGNEE's home, not the
 dispatcher's.
 
+The card's WORKSPACE is bound with ``set_session_cwd`` for the same reason: the project tier
+resolves through ``find_project_root()`` → ``resolve_agent_cwd()``, i.e. session cwd, then
+``TERMINAL_CWD``, then the process cwd. A worker is launched with ``cwd=workspace`` AND
+``env["TERMINAL_CWD"] = workspace``, while the dispatch-time check runs inside the dispatcher
+process — so without this binding the two halves answered one question from two different project
+roots, and a live project-tier pin was convicted and the card parked in ``blocked`` with a false
+"Unknown skill(s)". Binding is the fix; skipping the tier would only hide the disagreement.
+
+Every degrade path (no seat, unreadable config, resolver error, per-name failure) logs a WARNING and
+returns the SAME verdict it always did. A guard rail whose seats silently stopped being guarded is
+indistinguishable from a healthy one, which is the failure mode decision item 5 was written against.
+
+Deliberately NOT mirrored: the DECLARED-NAME gate (``skill_view`` checks the resolved frontmatter
+``name:``, not only the identifier a card pins) and the PLATFORM gate (``skill_matches_platform``).
+Both are therefore FALSE NEGATIVES — a pin this guard passes but the loader refuses to serve, which
+is the lenient direction this module is happy to fail in. Do not assume they are covered here.
+
 This module answers "can this seat load these names"; it never decides policy. Callers decide
 whether an unresolvable pin is fatal.
 """
@@ -41,8 +58,11 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 from pathlib import Path
 from typing import Iterable, Optional
+
+logger = logging.getLogger(__name__)
 
 
 def resolve_seat_home(assignee: Optional[str]) -> Optional[Path]:
@@ -58,7 +78,11 @@ def resolve_seat_home(assignee: Optional[str]) -> Optional[Path]:
         from hermes_cli.profiles import resolve_profile_env
         return Path(resolve_profile_env(assignee))
     except Exception:
-        # Missing/tombstoned profile, or a name that is not a valid profile id at all.
+        # Missing/tombstoned profile, or a name that is not a valid profile id at all. Warned,
+        # because a seat that cannot be resolved is a seat that is no longer being guarded.
+        logger.warning(
+            "kanban skill guard: seat %r does not resolve to a profile home — validation skipped",
+            assignee, exc_info=True)
         return None
 
 
@@ -73,14 +97,47 @@ def _seat_scope(home: Path):
         reset_hermes_home_override(token)
 
 
+@contextlib.contextmanager
+def _workspace_scope(workspace: Optional[str | Path]):
+    """Bind *workspace* as the agent's logical cwd for the duration of the check.
+
+    ``resolve_agent_cwd`` reads the session cwd FIRST, then the scope's ``TERMINAL_CWD``, then the
+    process cwd — so pinning the card's workspace here makes the guard's project tier resolve
+    exactly like the worker's, which is launched with ``cwd=workspace`` and
+    ``env["TERMINAL_CWD"] = workspace``.
+
+    A falsy *workspace* binds NOTHING (``set_session_cwd`` is not called at all): callers that
+    genuinely do not know the workspace — a scratch card at create time — must keep today's
+    behaviour, and a binding that pointed at a not-yet-created directory would only add a
+    misleading "does not exist" warning before falling through to the same answer.
+    """
+    if not workspace:
+        yield
+        return
+    from agent.runtime_cwd import reset_session_cwd, set_session_cwd
+    token = set_session_cwd(str(workspace))
+    try:
+        yield
+    finally:
+        reset_session_cwd(token)
+
+
 def unresolvable_skills(
     names: Iterable[str], *, seat_home: Optional[Path],
+    workspace: Optional[str | Path] = None,
 ) -> Optional[tuple[list[str], list[str]]]:
     """Split *names* into ``(disabled, unknown)`` as *seat_home*'s own loader would see them.
 
+    *workspace* is the card's workspace: binding it (see ``_workspace_scope``) is what puts the
+    guard's project tier on the same root the worker resolves it from. Callers that know the
+    workspace must pass it; omitting it does not degrade to a different verdict for local skills,
+    only for project-local ones.
+
     Returns None when the check could not be run at all (no seat, unreadable config, a resolver
     error). None is NOT an all-clear and NOT a rejection — callers treat it as "no information,
-    carry on", because this is a guard rail and a flaky scan must never stop the fleet.
+    carry on", because this is a guard rail and a flaky scan must never stop the fleet. Every one
+    of those paths logs a WARNING: a fleet whose seats silently stopped being guarded must be
+    distinguishable from a healthy one.
 
     *disabled* names exist on disk but are switched off in that seat's ``skills.disabled``;
     *unknown* names do not resolve there at all. They are kept apart because the operator's fix is
@@ -88,14 +145,28 @@ def unresolvable_skills(
     """
     names = [str(n).strip() for n in names if str(n).strip()]
     if not names or seat_home is None or not Path(seat_home).is_dir():
+        if not names:
+            reason = "no skill names to check"
+        elif seat_home is None:
+            reason = "assignee seat does not resolve to a profile home"
+        else:
+            reason = f"seat directory does not exist: {seat_home}"
+        logger.warning(
+            "kanban skill guard: no verdict for %d pin(s) (%s) — validation skipped",
+            len(names), reason)
         return None
     try:
-        with _seat_scope(Path(seat_home)):
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(_seat_scope(Path(seat_home)))
+            stack.enter_context(_workspace_scope(workspace))
             if not _seat_config_usable(Path(seat_home)):
                 return None
             return _classify(names)
     except Exception:
         # Any resolver/config failure degrades to "no information" rather than a wrong verdict.
+        logger.warning(
+            "kanban skill guard: scan failed for seat %s — validation skipped (no verdict)",
+            seat_home, exc_info=True)
         return None
 
 
@@ -105,7 +176,8 @@ def _seat_config_usable(seat_home: Path) -> bool:
     ``load_config`` does NOT raise on a malformed file — it logs a corruption warning and falls back
     to defaults, so ``skills.disabled`` silently reads as empty. Verdict on that basis would be
     actively wrong: a pin that the operator disabled in the very file we failed to read would be
-    reported as fine. Degrade to "no information" instead.
+    reported as fine. Degrade to "no information" instead — loudly, since an unparsed seat config
+    means that seat's ``skills.disabled`` is currently unenforced everywhere, not just here.
     """
     config_path = Path(seat_home) / "config.yaml"
     if not config_path.is_file():
@@ -114,6 +186,9 @@ def _seat_config_usable(seat_home: Path) -> bool:
     try:
         return isinstance(yaml_load(config_path.read_text(encoding="utf-8-sig")), dict)
     except Exception:
+        logger.warning(
+            "kanban skill guard: seat config %s is unreadable — validation skipped (no verdict)",
+            config_path, exc_info=True)
         return False
 
 
@@ -212,6 +287,11 @@ def _classify(names: list[str]) -> tuple[list[str], list[str]]:
             # this drops the name from BOTH lists, so a bad pin reads as "no information" rather
             # than as a conviction. A missed check is recoverable; a false one is not — it refuses
             # a card whose skills all load, and at dispatch that parks the card in `blocked`.
+            # The name vanishing from BOTH lists is exactly what makes this a silent hole, so say
+            # so out loud: "checked, no verdict" must never look identical to "checked, fine".
+            logger.warning(
+                "kanban skill guard: resolution of pin %r raised — dropping it from both lists "
+                "(no verdict for this pin)", name, exc_info=True)
             continue
     return disabled, unknown
 

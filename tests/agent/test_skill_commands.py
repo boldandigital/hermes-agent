@@ -678,6 +678,66 @@ class TestBuildPreloadedSkillsPrompt:
         assert "Disabled skill(s)" in format_missing_skills(missing, disabled)
 
 
+    def test_unknown_skill_nested_under_a_disabled_directory_is_not_reported_disabled(self, tmp_path, monkeypatch):
+        """A pin under a disabled-named parent is not that parent.
+
+        The pre-load gate compared EVERY path segment, so any identifier whose ancestor directory
+        matched a disabled entry was convicted as disabled. That is the same class of lie the
+        pre-load gate exists to prevent, pointed the other way: a name that does not exist at all
+        was told "enable it" instead of "that name is wrong".
+        """
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            # The disabled name is the PARENT directory; the pin below it does not exist on disk.
+            import agent.skill_utils as su_module
+            from agent.skill_commands import format_missing_skills
+            monkeypatch.setattr(
+                su_module, "get_disabled_skill_names", lambda platform=None: {"pdf"}
+            )
+
+            ghost = tmp_path / "software-development" / "pdf" / "definitely-not-a-real-skill" / "SKILL.md"
+            disabled: list = []
+            _, loaded, missing = build_preloaded_skills_prompt(
+                [str(ghost)], disabled_out=disabled
+            )
+            assert not loaded, "no skill should have been loaded"
+
+        assert disabled == [], "an ancestor directory must not convict an unknown skill as disabled"
+        assert missing, "the pin must still be reported as missing/unknown"
+        message = format_missing_skills(missing, disabled)
+        assert "Unknown skill(s)" in message
+        assert "Disabled skill(s)" not in message
+
+
+    def test_enabled_skill_under_a_disabled_directory_still_loads(self, tmp_path, monkeypatch):
+        """Tightening must not only refuse lies — it must not convict a live, enabled skill.
+
+        Same nested shape as the false positive, but the skill exists and is NOT disabled, so the
+        leaf-only comparison is what lets it through. Pinning uses the ``tier/name`` form because
+        ``skill_view`` rejects both ``<name>/SKILL.md`` and absolute paths ("Skill name must be a
+        relative path within the skills directory") for every depth, so a path pin could not
+        demonstrate a load at all. ``tier/name`` still puts the disabled ``pdf`` in a non-leaf
+        segment, which is exactly what an all-segments comparison would convict on.
+        """
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            # Re-home a real skill under a directory whose name IS disabled, to build the nested shape.
+            _make_skill(tmp_path / "pdf", "live-enabled-skill", body="LOADED BODY.")
+
+            import agent.skill_utils as su_module
+            monkeypatch.setattr(
+                su_module, "get_disabled_skill_names", lambda platform=None: {"pdf"}
+            )
+
+            disabled: list = []
+            prompt, loaded, _missing = build_preloaded_skills_prompt(
+                ["pdf/live-enabled-skill"], disabled_out=disabled
+            )
+
+        assert disabled == [], "the disabled name is an ancestor directory, not this skill"
+        assert loaded, "a live enabled skill must still load"
+        assert not _missing, "a live enabled skill must not be reported missing"
+        assert "LOADED BODY." in prompt, "the live skill's body must actually reach the prompt"
+
+
     def test_disabled_skill_caught_when_the_loaded_name_differs_from_the_pin(self, tmp_path, monkeypatch):
         """The post-load branch: the body LOADS, but the canonical name is what the operator disabled.
 

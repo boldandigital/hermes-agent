@@ -800,7 +800,10 @@ def _names_disabled(disabled_names: set, *candidates: str) -> bool:
     the segment after a ``tier:name`` separator.
 
     A pinned absolute path normalizes to ``<name>/SKILL.md`` (see ``normalize_skill_lookup_name``), which
-    is still not the disabled key, so the owning directory name is compared too. Without that, ``hermes -s
+    is still not the disabled key, so the skill's OWNING directory — the segment directly above
+    ``SKILL.md``, which is what ``_is_skill_disabled`` compares as ``frontmatter name / skill dir name`` —
+    is compared too. Only that leaf: comparing every segment made any identifier nested under a
+    disabled-named directory classify as disabled. Without the leaf, ``hermes -s
     /abs/path/to/<disabled-skill>/SKILL.md`` reported "Unknown skill(s)" for a skill present on disk.
     """
     names = set()
@@ -819,11 +822,18 @@ def _names_disabled(disabled_names: set, *candidates: str) -> bool:
             names.add(normalized)
         if ":" in value:
             names.add(value.split(":", 1)[1])
-        # ``<name>/SKILL.md`` and ``<tier>/<name>/SKILL.md`` both carry the disabled key in a parent
-        # segment; skill_view() resolves those to the same skill, so compare them here too.
-        for segment in (normalized or value).replace("\\", "/").split("/"):
-            if segment and segment not in (".", "..", "SKILL.md"):
-                names.add(segment)
+        # A pinned path normalizes to ``<name>/SKILL.md`` (or ``<tier>/<name>/SKILL.md``), where the
+        # disabled key is the skill's OWNING directory: the segment directly above SKILL.md. Compare
+        # that leaf alone, matching the loader's ``frontmatter name / skill dir name``. Comparing every
+        # segment made ANY skill nested under a disabled-named directory classify as disabled, so an
+        # unknown name was told "enable it" instead of "that name is wrong".
+        leaf = next(
+            (s for s in reversed((normalized or value).replace("\\", "/").split("/"))
+             if s and s not in (".", "..", "SKILL.md")),
+            "",
+        )
+        if leaf:
+            names.add(leaf)
     return bool(names & disabled_names)
 
 

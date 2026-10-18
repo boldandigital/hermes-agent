@@ -1181,8 +1181,36 @@ def _normalize_task_skills(skills: Optional[Iterable[str]]) -> Optional[list[str
     return cleaned
 
 
+def _create_time_workspace(
+    workspace_kind: Optional[str], workspace_path: Optional[str],
+) -> Optional[str]:
+    """The workspace to bind for a CREATE-time skill check, or None when it is not knowable yet.
+
+    The project tier resolves from the agent cwd (``find_project_root`` → ``resolve_agent_cwd``), so
+    a create-time verdict is only trustworthy when the path the DISPATCHER will resolve is already
+    final and real. That is exactly the ``dir`` kind: ``resolve_workspace`` returns
+    ``workspace_path`` verbatim at dispatch, so both halves answer from the same root.
+
+    Everything else is None, deliberately:
+
+    * ``scratch`` — the path does not exist until dispatch (``<workspaces_root>/<id>``), and a
+      scratch dir is not a git repo, so ``find_project_root()`` returns None there regardless.
+      Resolving one now would be guessing a workspace the dispatcher has not chosen yet.
+    * ``worktree`` — the path is derived at dispatch (repo root anchors ``<repo>/.worktrees/<id>``,
+      or the board ``default_workdir`` may fill in after this call). A repo root is a DIFFERENT
+      project root than the worktree that actually runs the card, so binding it here could convict
+      a pin the worktree resolves. Leaving it to the dispatch-time check, which knows the real
+      path, is the honest answer rather than a guess at a different workspace kind.
+    """
+    if workspace_kind != "dir" or not workspace_path:
+        return None
+    candidate = Path(str(workspace_path)).expanduser()
+    return str(candidate) if candidate.is_absolute() and candidate.is_dir() else None
+
+
 def _validate_task_skills(
     skills: Optional[Iterable[str]], assignee: Optional[str],
+    workspace: Optional[str] = None,
 ) -> None:
     """Raise ValueError when a pinned skill cannot be loaded from the ASSIGNEE's own seat.
 
@@ -1197,6 +1225,13 @@ def _validate_task_skills(
     gate. Resolution itself is delegated to ``kanban_skill_guard`` so this check and the
     dispatch-time check can never disagree with the loader.
 
+    *workspace* is the card's workspace, and it is OPTIONAL: only pass it when it is already final
+    (``_create_time_workspace`` explains exactly when that is). The project tier resolves from the
+    agent cwd, so without the workspace a project-tier pin is judged from the CREATOR's cwd —
+    answerable when the operator is standing in the project (and wrong when they are not), which is
+    why this is a best-effort early check and NOT the authority: the dispatcher's check, which
+    knows the workspace it is about to launch into, is what a card is finally judged by.
+
     The dispatcher runs its own check on the fully-assembled skill set (see
     ``kanban_db_dispatch``), which additionally covers the ``sdlc-review`` it injects itself on the
     review lane. This function guards genuine operator pins only.
@@ -1205,7 +1240,7 @@ def _validate_task_skills(
         return
     from hermes_cli import kanban_skill_guard as _guard
     seat_home = _guard.resolve_seat_home(assignee)
-    verdict = _guard.unresolvable_skills(skills, seat_home=seat_home)
+    verdict = _guard.unresolvable_skills(skills, seat_home=seat_home, workspace=workspace)
     if verdict is None:
         return  # no seat, or the scan could not run — carry on.
     disabled, unknown = verdict
@@ -1281,7 +1316,12 @@ def create_task(
     )
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
-    _validate_task_skills(skills_list, assignee)
+    # Best-effort workspace for the project tier: only a ``dir`` card's path is already final
+    # here (see ``_create_time_workspace``) — scratch and worktree pass None and are judged by the
+    # dispatcher's check, which knows the workspace it is about to launch into.
+    _validate_task_skills(
+        skills_list, assignee,
+        workspace=_create_time_workspace(workspace_kind, workspace_path))
 
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
     # race may insert twice, the next lookup stabilises on the newest.

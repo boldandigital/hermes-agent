@@ -2021,6 +2021,7 @@ def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -
 
 def _validate_worker_skills(
     conn: sqlite3.Connection, claimed: Task, *, failure_limit: int,
+    workspace: Optional[str] = None,
 ) -> bool:
     """True when *claimed*'s pinned skills can all be loaded from its own assignee's seat.
 
@@ -2029,6 +2030,13 @@ def _validate_worker_skills(
     ``skills.disabled`` spawned a worker that died at ``Initializing agent...`` — before reading the
     card, and identically on every retry. Nothing on the card was ever at fault; the card had no
     ``skills`` at all.
+
+    *workspace* is the card's RESOLVED workspace, and it must be passed: the project tier resolves
+    from the agent cwd (``find_project_root`` → ``resolve_agent_cwd``), the worker is launched with
+    ``cwd=workspace`` + ``TERMINAL_CWD=workspace``, and this check runs in the dispatcher process.
+    Without the workspace the guard answers from the dispatcher's own project root, convicts a pin
+    the worker loads, and parks the card in ``blocked`` with a false "Unknown skill(s)" — the guard
+    rail stranding the fleet on a healthy pin.
 
     Records a normal spawn failure when the verdict is negative (releasing the claim and closing the
     run, exactly like a workspace or spawn error) so the operator sees WHICH skill and WHICH seat,
@@ -2041,7 +2049,7 @@ def _validate_worker_skills(
     try:
         from hermes_cli import kanban_skill_guard as _guard
         seat_home = _guard.resolve_seat_home(claimed.assignee)
-        verdict = _guard.unresolvable_skills(skills, seat_home=seat_home)
+        verdict = _guard.unresolvable_skills(skills, seat_home=seat_home, workspace=workspace)
     except Exception as exc:  # never let the guard itself break a dispatch tick
         _kb._log.debug("kanban dispatcher: skill preflight skipped for %s (%s)", claimed.id, exc)
         return True
@@ -2161,7 +2169,9 @@ def _dispatch_lane_task(
     # dispatcher forces on itself as well as any the card pinned. A name that will not load in the
     # claiming seat kills the worker at "Initializing agent..." before it reads the card, and burns
     # every retry on the same verdict; refuse here instead, naming the skill and the seat.
-    if not _validate_worker_skills(conn, claimed, failure_limit=failure_limit):
+    # ``workspace=workspace``: the project tier must resolve from the workspace the worker will
+    # actually be launched into, not from the dispatcher's own cwd.
+    if not _validate_worker_skills(conn, claimed, failure_limit=failure_limit, workspace=workspace):
         return False
     try:
         pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)

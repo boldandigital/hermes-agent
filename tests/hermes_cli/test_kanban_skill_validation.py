@@ -15,14 +15,22 @@ Two layers, because the pin has two sources:
 
 Both layers answer the same question with the same mechanism: *would the loader this seat will
 actually use resolve this name?* A validator that disagrees with the loader is worse than none, so
-both resolve through :func:`agent.skill_commands.build_preloaded_skills_prompt` under the assignee's
-own ``HERMES_HOME`` — the very call the worker makes at init — instead of re-implementing
-resolution. The ``disabled_out`` seam keeps a present-but-off pin from being called "unknown"
-(wording owned by card t_717b821e; this asserts the *classification*, not the prose).
+both delegate to :mod:`hermes_cli.kanban_skill_guard`, which MIRRORS the loader's own steps
+(``_skill_search_dirs`` → ``_locate_skill``, the ``skills.disabled`` pre-load gate, the identifier
+normalization) under the assignee's own ``HERMES_HOME`` and the card's workspace — deliberately
+NOT ``skill_view``/``build_preloaded_skills_prompt``, which read bodies and mark skills read, so a
+validator has no side effects on the thing it validates.
+
+Ground truth for every test here is :func:`agent.skill_commands._load_skill_payload` — the worker's
+own call, bound the way the worker is bound (seat home, session cwd = the card's workspace). Each
+test asserts THAT loads (or refuses) BEFORE asserting anything about the guard: a fixture the
+loader cannot serve would otherwise read exactly like a guard defect, and a guard that returns the
+right answer for the wrong reason would pass.
 
 Validation is a guard rail, not a gate: if the scan cannot run (unreadable config, broken profile
-dir, unknown assignee) creation and dispatch both proceed untouched. A flaky scan must never stop
-the fleet.
+dir, unknown assignee) creation and dispatch both proceed untouched, loudly — every degrade path
+logs a WARNING. A flaky scan must never stop the fleet, and a fleet that silently stopped being
+guarded must never look like a healthy one.
 """
 from __future__ import annotations
 
@@ -124,6 +132,20 @@ def _register_plugin_skill(monkeypatch, tmp_path, namespace: str, bare: str) -> 
     pm._discovered = True
     monkeypatch.setattr(plugins_mod, "_plugin_manager", pm)
     return md
+
+
+def _trust_project_root(home: Path, root: Path) -> None:
+    """Add *root* to the seat's ``skills.trusted_project_dirs``.
+
+    That is the exact key ``agent.skill_utils._project_trusted_dirs_from_config`` reads
+    (``skills.trusted_project_dirs``, absolute paths, ``~``/``${VAR}`` expanded). Project-local
+    skills are searched ONLY when the nearest ``.git`` ancestor of the agent cwd is trusted
+    (``_current_project_root(trusted=True)`` → ``get_project_skills_dirs``), so without this line
+    the ground-truth probe below would fail and every assertion after it would be vacuous.
+    """
+    (home / "config.yaml").write_text(
+        "skills:\n  disabled: []\n  trusted_project_dirs:\n    - " + str(root) + "\n",
+        encoding="utf-8")
 
 
 def _stage_review(conn, assignee: str) -> str:
@@ -475,3 +497,108 @@ def test_dispatch_guard_does_not_block_when_the_scan_cannot_run(seats, board, mo
         kbd.dispatch_once(conn, spawn_fn=lambda t, w, **k: spawned.append(t.id) or 4242)
 
     assert spawned == [task_id]
+
+
+def test_project_tier_pin_resolves_from_the_card_workspace_not_the_dispatcher_cwd(
+        seats, board, monkeypatch, tmp_path):
+    """The guard resolved TIER_PROJECT from the DISPATCHER's cwd; the worker resolves it from the
+    card's workspace — so a healthy pin was convicted and the card parked.
+
+    ``_skill_search_dirs`` includes the project tier, and its roots come from
+    ``get_project_skills_dirs()`` → ``find_project_root()`` → ``resolve_agent_cwd()``: session cwd,
+    then ``TERMINAL_CWD``, then the PROCESS cwd. The worker is spawned with ``cwd=workspace`` AND
+    ``env["TERMINAL_CWD"] = workspace`` (``kanban_db_dispatch.py``: ``if workspace and
+    os.path.isabs(workspace) and os.path.isdir(workspace): env["TERMINAL_CWD"] = workspace``) — a
+    contract the repo already pins in ``test_kanban_worker_terminal_cwd.py``. The guard runs INSIDE
+    the dispatcher process, so it answered from the dispatcher's own project root, found no
+    project tier at all, and reported a live pin as ``Unknown skill(s)``.
+
+    That is not a warning at dispatch: ``_validate_worker_skills`` records it via
+    ``_record_task_failure(outcome="spawn_failed")``, so the card parks itself in ``blocked``
+    carrying a false verdict — the guard rail stranding the fleet on exactly the pin it exists to
+    protect. This suite had ZERO project-tier coverage, which is why 17 green tests sat on top of
+    it.
+
+    Shape: the card is created from INSIDE the project (an operator's cwd), so create-time
+    validation sees the project tier and lets the pin through; the dispatcher then runs from its
+    own cwd, which is not the workspace. Both halves must agree.
+    """
+    workspace = tmp_path / "card-workspace"
+    (workspace / ".git").mkdir(parents=True)  # a bare .git DIR is what find_project_root accepts
+    _write_skill(workspace / ".hermes" / "skills", "workspace-skill")
+    _trust_project_root(seats["alpha"], workspace)
+
+    # Ground truth FIRST: bind the workspace exactly as the worker is bound (session cwd, which
+    # resolve_agent_cwd reads BEFORE TERMINAL_CWD and before the process cwd) plus the seat home
+    # `hermes -p alpha` gives the worker, then ask the WORKER's own loader. If that cannot load the
+    # pin, every assertion below proves nothing.
+    from agent.runtime_cwd import reset_session_cwd, set_session_cwd
+    from agent.skill_commands import _load_skill_payload
+    from agent.skill_utils import get_project_skills_dirs
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    cwd_token = set_session_cwd(str(workspace))
+    home_token = set_hermes_home_override(str(seats["alpha"]))
+    try:
+        assert [Path(p) for p in get_project_skills_dirs()] == [workspace / ".hermes" / "skills"], (
+            "fixture is wrong: the trusted project root must expose its skills dir, or the loader "
+            "cannot serve the pin the way a worker launched into this workspace would")
+        assert _load_skill_payload("workspace-skill"), (
+            "fixture is wrong, not the guard: a worker with cwd/TERMINAL_CWD=workspace loads this "
+            "pin, so the guard must not call it unknown")
+    finally:
+        reset_hermes_home_override(home_token)
+        reset_session_cwd(cwd_token)
+
+    # The CREATE layer must agree, or the operator is refused while standing OUTSIDE the project. A
+    # ``dir`` card's path is already final at create time, so ``_create_time_workspace`` binds it
+    # for that check too (scratch/worktree pass None by design — their path is only known at
+    # dispatch, and the dispatcher's check is the authority for those). Archived straight away so
+    # this probe card cannot reach the dispatch ticks below.
+    with kbc.connect(board) as conn:
+        probe = kb.create_task(conn, title="t-create", assignee="alpha",
+                               workspace_kind="dir", workspace_path=str(workspace),
+                               skills=["workspace-skill"])
+        kb.archive_task(conn, probe)
+
+    spawned: list[str] = []
+    with kbc.connect(board) as conn:
+        cwd_token = set_session_cwd(str(workspace))
+        try:
+            task_id = kb.create_task(conn, title="t", assignee="alpha",
+                                     workspace_kind="dir", workspace_path=str(workspace),
+                                     skills=["workspace-skill"])
+        finally:
+            reset_session_cwd(cwd_token)
+
+        monkeypatch.setattr(kbd._kb, "profile_exists", lambda name: True, raising=False)
+        kbd.dispatch_once(conn, spawn_fn=lambda t, w, **k: spawned.append(t.id) or 4242)
+        parked = kb.get_task(conn, task_id)
+
+        assert spawned == [task_id], (
+            "the worker loads 'workspace-skill' from its own workspace, so it must spawn; parking "
+            f"the card in {getattr(parked, 'status', None)!r} with "
+            f"{(parked.last_failure_error if parked else None)!r} is the false positive this guards")
+        assert "Unknown skill(s)" not in ((parked.last_failure_error if parked else None) or "")
+
+        # Teeth, on the same tier and through the same layer: a second card's pin STOPPED resolving
+        # after it was created, so the guard must still refuse it. Without this the test would be
+        # satisfied by a guard that passes every project-tier pin unconditionally — the no-op
+        # validator that satisfies any suite which never exercised it.
+        import shutil
+        cwd_token = set_session_cwd(str(workspace))
+        try:
+            doomed_dir = _write_skill(workspace / ".hermes" / "skills", "doomed-skill")
+            doomed = kb.create_task(conn, title="t2", assignee="alpha",
+                                    workspace_kind="dir", workspace_path=str(workspace),
+                                    skills=["doomed-skill"])
+        finally:
+            reset_session_cwd(cwd_token)
+        shutil.rmtree(doomed_dir)
+        kbd.dispatch_once(conn, spawn_fn=lambda t, w, **k: spawned.append(t.id) or 4242)
+        refused = kb.get_task(conn, doomed)
+
+    assert doomed not in spawned, (
+        "a project-tier pin that no longer resolves must still be refused — the workspace binding "
+        "must not turn the project tier into a blanket pass")
+    failure = (refused.last_failure_error if refused else None) or ""
+    assert "doomed-skill" in failure, f"the refusal must name the pin, got {failure!r}"

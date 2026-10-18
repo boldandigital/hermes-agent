@@ -99,10 +99,49 @@ def _validated_runtime_venv(env: dict) -> Path | None:
         return None
 
 
+def _install_generation_site_packages(root: Path) -> list[Path]:
+    """Every ``site-packages`` dir of EVERY generation this install owns.
+
+    ``selected_venv`` alone proves only the CURRENT selection. A process that
+    outlived a generation switch still carries the superseded generation's
+    site-packages in its environment (PM writes it at
+    ``pm/environments.py`` activation time), and that entry is not the
+    selection, so the exact-match ownership rule preserved it verbatim -- a
+    Hermes 3.14 site-packages then shadowed a project's own 3.11 venv and
+    every ``import`` of the shadowed package failed. Ownership is decided by
+    path provenance, so widening it to the install's own ``environments/`` tree
+    stays a provenance test and never touches a user path.
+
+    Best-effort: a missing or unreadable tree contributes nothing, leaving the
+    exact-match rule (and its behaviour) unchanged.
+    """
+    try:
+        from pm.environments import install_state_dir
+        environments_root = install_state_dir(root) / "environments"
+        found = [
+            site_packages_dir for venv in sorted(environments_root.glob("*/venv"))
+            if (site_packages_dir := _site_packages_of(venv)) is not None
+        ]
+    except (OSError, RuntimeError, ValueError):
+        return []
+    return found
+
+
+def _site_packages_of(venv: Path) -> Path | None:
+    """The venv's site-packages dir, or None when it has none yet (partial build)."""
+    try:
+        from pm.environments import site_packages
+        candidate = site_packages(venv)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return candidate if candidate.is_dir() else None
+
+
 def _get_hermes_site_packages(env: dict) -> list[Path]:
     """Exact site-packages dirs owned by the Hermes runtime (cached):
     ``site.getsitepackages()`` with a ``sys.prefix`` fallback, plus a validated
-    Windows base-interpreter launch's ``VIRTUAL_ENV/Lib/site-packages``."""
+    Windows base-interpreter launch's ``VIRTUAL_ENV/Lib/site-packages``, plus
+    every generation of this install's own dependency environments."""
     local = _state()
     if local._hermes_site_packages is None:
         result: list[Path] = []
@@ -125,6 +164,13 @@ def _get_hermes_site_packages(env: dict) -> list[Path]:
         runtime_site_packages = site_packages(runtime_venv)
         if not any(_same_path(runtime_site_packages, existing) for existing in result):
             result.append(runtime_site_packages)
+
+    # Every generation, not just the selection: a superseded one sitting in an
+    # inherited PYTHONPATH is still Hermes-owned (see the helper's docstring).
+    for alias in _state()._hermes_repo_root_aliases:
+        for generation_sp in _install_generation_site_packages(alias):
+            if not any(_same_path(generation_sp, existing) for existing in result):
+                result.append(generation_sp)
     return result
 
 

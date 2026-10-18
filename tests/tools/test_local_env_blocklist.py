@@ -6,6 +6,7 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -582,6 +583,79 @@ def test_pythonpath_descendants_are_not_owned():
     env = {"PYTHONPATH": os.pathsep.join(entries)}
     pp._strip_hermes_owned_pythonpath(env)
     assert env["PYTHONPATH"].split(os.pathsep) == entries
+
+
+@pytest.mark.platforms("linux", "macos", "windows")
+def test_superseded_generation_site_packages_is_owned(monkeypatch, tmp_path):
+    """A generation the install no longer selects is still Hermes-owned.
+
+    PM writes the selected generation's site-packages into the environment of
+    every process it activates (pm/environments.py), so a process that outlived
+    a generation switch inherits the SUPERSEDED generation too. Proving
+    ownership from the selection alone left that entry in place: a 3.14
+    site-packages then outranked a project's own 3.11 venv in sys.path and every
+    import of the shadowed package died with a fabricated missing-module error.
+    """
+    repo = tmp_path / "hermes-agent"
+    generations = repo.parent / "installs" / "key" / "environments"
+    selected = generations / "selected0000000000000" / "venv" / "lib" / "python3.14" / "site-packages"
+    superseded = generations / "superseded00000000" / "venv" / "lib" / "python3.14" / "site-packages"
+    for sp in (selected, superseded):
+        sp.mkdir(parents=True)
+    (selected / "numpy").mkdir()
+
+    monkeypatch.setattr(pp, "_state", lambda: SimpleNamespace(
+        _hermes_repo_root_aliases=(repo,),
+        _in_venv=False,
+        _hermes_site_packages=None,
+    ))
+    monkeypatch.setattr(pp, "_validated_runtime_venv", lambda env: generations / "selected0000000000000" / "venv")
+    monkeypatch.setattr("pm.environments.install_state_dir",
+                        lambda project_root: repo.parent / "installs" / "key")
+
+    # Both the selection and the superseded generation are proven owned, so the
+    # stale entry is stripped while a user path alongside it survives.
+    owned = pp._get_hermes_site_packages({})
+    assert selected in owned and superseded in owned
+
+    user = str(tmp_path / "my-own-libs")
+    env = {"PYTHONPATH": os.pathsep.join([str(repo), str(selected), str(superseded), user])}
+    pp._strip_hermes_owned_pythonpath(env)
+    assert env["PYTHONPATH"] == user
+
+
+@pytest.mark.platforms("linux", "macos", "windows")
+def test_generation_provenance_ignores_foreign_paths(monkeypatch, tmp_path):
+    """Widening ownership to the install's generations must not widen it past them.
+
+    A user site-packages that merely looks like a Hermes one -- a different
+    version directory, a similarly named tree, or a sibling path -- stays
+    untouched, so the widened provenance cannot become 'drop the whole
+    PYTHONPATH'.
+    """
+    repo = tmp_path / "hermes-agent"
+    generations = repo.parent / "installs" / "key" / "environments"
+    real = generations / "gen0000000000000000" / "venv" / "lib" / "python3.14" / "site-packages"
+    real.mkdir(parents=True)
+
+    monkeypatch.setattr(pp, "_state", lambda: SimpleNamespace(
+        _hermes_repo_root_aliases=(repo,),
+        _in_venv=False,
+        _hermes_site_packages=None,
+    ))
+    monkeypatch.setattr(pp, "_validated_runtime_venv", lambda env: None)
+    monkeypatch.setattr("pm.environments.install_state_dir",
+                        lambda project_root: repo.parent / "installs" / "key")
+
+    foreign = [
+        str(generations / "gen0000000000000000" / "venv" / "lib" / "python3.11" / "site-packages"),
+        str(generations / "gen0000000000000000" / "user-data"),
+        str(generations.parent / "other-install" / "environments" / "g" / "venv" / "lib" / "python3.14" / "site-packages"),
+        "/nix/store/user-plugin/lib/python3.12/site-packages",
+    ]
+    env = {"PYTHONPATH": os.pathsep.join([str(repo), str(real), *foreign])}
+    pp._strip_hermes_owned_pythonpath(env)
+    assert env["PYTHONPATH"].split(os.pathsep) == foreign
 
 
 @pytest.mark.platforms("linux", "macos", "windows")
