@@ -527,6 +527,21 @@ class Nodejs(_BionicDebArm, BinaryPackage, DebPackage):
         # lockfile is written rather than selecting glibc bytes on musl.
         return node_latest_versions()
 
+    def known_sha256(self, version: str, url: str) -> Optional[str]:
+        """Take nodejs.org digests only from the releaser-signed SHASUMS256.txt.
+
+        Hashing the download would pin whatever the server sent. The termux deb
+        and the unofficial musl builds publish no signature, so they still hash.
+        """
+        if not url.startswith("https://nodejs.org/dist/"):
+            return None
+        filename = url.rsplit("/", 1)[1]
+        for line in _node_signed_sums(version).splitlines():
+            digest, _, name = line.partition("  ")
+            if name == filename:
+                return digest
+        raise InstallError(self.name, f"{filename} is not in v{version}'s signed SHASUMS256.txt")
+
     def repair_staged_verification(self, entry: Path, target: str, reason: str) -> tuple[str, str]:
         """Repair the host library needed by official Linux Node, then re-probe.
 
@@ -1203,6 +1218,37 @@ class LlamaCpp(BinaryPackage):
         if libs:
             shutil.copyfile(libs[0], staged / "libgomp.so.1")
             shutil.rmtree(staged / "usr")
+
+
+def _node_signed_sums(version: str) -> str:
+    """v{version}'s SHASUMS256.txt, verified against the vendored active-releaser keys.
+
+    pm/keys/nodejs-release-keys.asc is the "Active releasers" block of
+    nodejs/release-keys; refresh it from that repo's README when a releaser
+    joins. The verifier needs pysequoia, which only the checkout's test
+    environment carries: pinning is maintainer work and nothing ships it.
+    """
+    from pm.paths import repo_root
+    from pm.testenv import testenv_python
+    from pm.update import _get_text
+
+    python = testenv_python(repo_root())
+    if python is None:
+        raise InstallError("node", "verifying nodejs.org signatures needs the test environment",
+                           "run `source ./activate`, then retry")
+    signed = _get_text(f"https://nodejs.org/dist/v{version}/SHASUMS256.txt.asc")
+    here = Path(__file__).resolve().parent
+    with tempfile.TemporaryDirectory(prefix="pm-node-sums-") as temp:
+        path = Path(temp) / "SHASUMS256.txt.asc"
+        path.write_text(signed, encoding="utf-8")
+        proc = subprocess.run(
+            [str(python), "-I", str(here / "verify_openpgp.py"),
+             str(here / "keys" / "nodejs-release-keys.asc"), str(path)],
+            capture_output=True, text=True, timeout=60, check=False,
+        )
+    if proc.returncode:
+        raise InstallError("node", f"v{version} SHASUMS256.txt.asc failed verification: {proc.stderr.strip()}")
+    return proc.stdout
 
 
 def _github_release_digests(repo: str, tag: str) -> dict[str, str]:

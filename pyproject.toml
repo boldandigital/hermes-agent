@@ -543,6 +543,8 @@ dev = [
   "ty==0.0.82",
   "ruff==0.15.10",
   "setuptools==83.0.0",
+  # pm update verifies nodejs.org's signed SHASUMS256.txt with it (pm/verify_openpgp.py).
+  "pysequoia==0.1.35",
 ] # starlette: CVE-2026-48710; setuptools: 83 (torch >=2.13 requires setuptools 83)
 # Native launcher and provider-catalog E2E dependencies belong in the test
 # environment, not the core runtime. Keep the Anthropic SDK at the same
