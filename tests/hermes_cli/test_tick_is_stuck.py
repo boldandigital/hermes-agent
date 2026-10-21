@@ -65,10 +65,20 @@ class TestGeneratorMaterialization:
         )
 
     def test_two_results_one_defer_one_hold_via_generator(self):
-        """Gate's most precise repro: two separate results, one in each bucket."""
-        deferral = _res(skipped_per_profile_capped=[("t1", "gate", 1)])
+        """Gate's most precise repro: two separate results, one in each bucket.
+
+        ORDER MATTERS for the generator bug. The hold must come FIRST: the
+        first ``any()`` (legitimate-deferred) pulls the hold result, finds no
+        legit bucket on it, and keeps pulling until it reaches the deferral,
+        which satisfies it and stops. The generator is then exhausted, so the
+        second ``any()`` (other-hold) reads nothing and the real stall is
+        swallowed. With the deferral FIRST the first ``any()`` short-circuits
+        before consuming the hold, so the second pass still sees it - that
+        ordering passes with and without the fix and proves nothing.
+        """
         real_hold = _res(rate_limited=["t2"])
-        gen = (r for r in [deferral, real_hold])
+        deferral = _res(skipped_per_profile_capped=[("t1", "gate", 1)])
+        gen = (r for r in [real_hold, deferral])
         assert tick_is_stuck(gen, True, False) is True, (
             "separate deferral + real hold must be reported as stuck"
         )
@@ -86,23 +96,38 @@ class TestGeneratorMaterialization:
             f"same tick"
         )
 
-    @pytest.mark.parametrize(
-        "legit,hold",
-        [
-            ("skipped_per_profile_capped", "respawn_guarded"),
-            ("skipped_per_profile_capped", "memory_pressure"),
-            ("skipped_nonspawnable", "rate_limited"),
-            ("auto_assigned_default", "respawn_guarded"),
-        ],
-    )
+    # A truthy value for EVERY legitimate-deferral bucket, so no matrix row
+    # silently degrades into a hold-alone case (which passes with or without
+    # the fix and therefore proves nothing).
+    _LEGIT_VALUE = {
+        "skipped_per_profile_capped": [("t1", "gate", 1)],
+        "skipped_nonspawnable": ["t1"],
+        "auto_assigned_default": ["t1"],
+    }
+    _HOLD_VALUE = {
+        "respawn_guarded": [("t1", "active_pr")],
+        "rate_limited": ["t1"],
+        "memory_pressure": "critical",
+    }
+
+    @pytest.mark.parametrize("legit", sorted(_LEGIT_VALUE))
+    @pytest.mark.parametrize("hold", sorted(_HOLD_VALUE))
     def test_every_legit_vs_every_hold_via_generator(self, legit, hold):
-        legit_val = [("t1", "g", 1)] if legit == "skipped_per_profile_capped" else None
-        kwargs = {legit: legit_val, hold: ["t1"]}
-        # normalise: only the real bucket value matters
-        if legit_val is None:
-            kwargs = {hold: ["t1"]}
+        """Every legit bucket x every hold bucket, hold FIRST, generator-fed.
+
+        Gate's non-blocking finding on the first version of this matrix: rows
+        whose legit bucket was not ``skipped_per_profile_capped`` fell through
+        a branch that DROPPED the deferral bucket entirely, turning them into
+        hold-alone cases that pass with or without the fix. Every row here
+        carries a real deferral, so every row must fail without the fix.
+        """
+        kwargs = {legit: self._LEGIT_VALUE[legit], hold: self._HOLD_VALUE[hold]}
+        # hold first -> the first any() consumes past the hold -> the second
+        # any() would read an exhausted generator without the materialisation
         gen = (r for r in [_res(**kwargs)])
-        assert tick_is_stuck(gen, True, False) is True
+        assert tick_is_stuck(gen, True, False) is True, (
+            f"legit={legit} + hold={hold} must be reported as stuck"
+        )
 
 
 # ── regressions already on the contract are still worked ─────────────────
