@@ -1518,6 +1518,17 @@ def _strip_dotted_keys(cfg: dict, dotted_keys: set) -> tuple[dict, set]:
 
 _ENV_REF_RE = re.compile(r"\${([^}]+)}")
 
+# KEY names of the launch ``.env`` as read once, the first time an unresolvable ref needs them.
+# Cached so the import-time expansion (which runs per process, before the dotenv loads) does not
+# re-read the file per ref; a test that repoints HERMES_HOME clears it via ``reset_dotenv_names_cache``.
+_PENDING_DOTENV_NAMES: Optional[frozenset] = None
+
+
+def reset_dotenv_names_cache() -> None:
+    """Drop the cached ``.env`` key names (tests that repoint ``HERMES_HOME``)."""
+    global _PENDING_DOTENV_NAMES
+    _PENDING_DOTENV_NAMES = None
+
 
 def _env_ref_lookup(name: str) -> Optional[str]:
     """Resolve the env var behind a ``${VAR}`` / ``${env:VAR}`` ref — plain ``os.environ`` outside
@@ -1536,6 +1547,39 @@ def _env_ref_lookup(name: str) -> Optional[str]:
     if current_secret_scope() is None:
         return os.environ.get(name)
     return _get_secret(name)
+
+
+def _pending_dotenv_names() -> frozenset:
+    """KEY names present in a dotenv file that has not been loaded into this process yet.
+
+    ``hermes_cli.config`` expands ``${env:...}`` refs at IMPORT time (``_inject_profile_env_vars``
+    -> ``providers.list_providers`` -> config read), which runs BEFORE ``main.py`` calls
+    ``load_hermes_dotenv()``. At that moment ``os.environ`` is empty for anything that lives only in
+    ``~/.hermes/.env``, so a perfectly configured variable warned "is not set (check ~/.hermes/.env)"
+    on every single invocation. These names are the file's own truth, so the message can be
+    suppressed for them and kept for a variable absent from BOTH the environment and the file.
+    """
+    global _PENDING_DOTENV_NAMES
+    cached = _PENDING_DOTENV_NAMES
+    if cached is not None:
+        return cached
+    names: set = set()
+    try:
+        from hermes_constants import get_process_hermes_home
+        candidates = [Path(get_process_hermes_home()) / '.env']
+    except Exception:
+        candidates = []
+    for path in candidates:
+        try:
+            if not path.exists():
+                continue
+            from agent.secret_scope import load_env_file
+            names |= set(load_env_file(path))
+        except Exception:
+            continue
+    frozen = frozenset(names)
+    _PENDING_DOTENV_NAMES = frozen
+    return frozen
 
 
 def _env_expand_match(m: re.Match) -> str:
@@ -1559,9 +1603,14 @@ def _env_expand_match(m: re.Match) -> str:
     if val is not None:
         return val
     if inner.startswith("env:"):
-        logger.warning(
-            "Config ref %r: %s is not set (check ~/.hermes/.env); "
-            "keeping the literal placeholder", raw, name)
+        # A name the not-yet-loaded dotenv DOES define is configured; this expansion only ran
+        # early (import-time provider discovery, before load_hermes_dotenv). The cache re-expands
+        # on env drift, so the real value lands later — warning here was a pure false alarm.
+        # A name in neither os.environ NOR the dotenv is genuinely missing and still warns.
+        if name not in _pending_dotenv_names():
+            logger.warning(
+                "Config ref %r: %s is not set (check ~/.hermes/.env); "
+                "keeping the literal placeholder", raw, name)
     return raw
 
 
