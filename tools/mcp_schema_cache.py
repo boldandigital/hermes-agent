@@ -56,19 +56,34 @@ def _save_all(data: dict[str, Any]) -> None:
     atomic_json_write(_cache_path(), data, mode=0o600)
 
 
+def _is_real_ttl(ttl_ms: Any) -> bool:
+    """True only for a positive numeric TTL. The MCP SDK models SEP-2549's ``ttlMs`` with default
+    0, so a synthesized 0 is indistinguishable from an explicit one by value alone; both are
+    treated as "no usable hint" rather than as a zero-length lifetime. ``bool`` is excluded
+    because it is an ``int`` subclass and ``True`` would otherwise read as a 1ms TTL."""
+    return (isinstance(ttl_ms, (int, float)) and not isinstance(ttl_ms, bool)
+            and float(ttl_ms) > 0)
+
+
 def get_cached_entry(server_name: str, fingerprint: str) -> Optional[dict]:
     """Return cached entry when fingerprint matches (and TTL holds), else None. ``tools/list``
     results may carry ``ttlMs`` (SEP-2549); an entry older than a recorded TTL is a miss so the
     next startup re-probes instead of serving a stale manifest forever. Entries without a TTL
-    never expire. ``cacheScope`` is irrelevant: this cache is per-user local disk."""
+    never expire. ``cacheScope`` is irrelevant: this cache is per-user local disk.
+
+    The ``_is_real_ttl`` guard also repairs entries already on disk from a build that stored the
+    SDK's default 0 — without it those entries stay a miss until the server is re-probed live."""
     with _cache_lock:
         entry = _load_all().get(server_name)
     if not isinstance(entry, dict) or entry.get("fingerprint") != fingerprint:
         return None
     ttl_ms = entry.get("ttl_ms")
     written_at = entry.get("written_at")
-    expired = (isinstance(ttl_ms, (int, float)) and isinstance(written_at, (int, float))
-               and (time.time() - written_at) * 1000.0 >= float(ttl_ms))
+    if _is_real_ttl(ttl_ms) and isinstance(written_at, (int, float)):
+        assert isinstance(ttl_ms, (int, float))  # narrowed by _is_real_ttl
+        expired = (time.time() - written_at) * 1000.0 >= float(ttl_ms)
+    else:
+        expired = False
     return None if expired else entry
 
 
@@ -78,7 +93,11 @@ def write_cache_entry(server_name: str, fingerprint: str, *, tools: list[dict],
     """Persist tool schemas after a successful live connect. ``ttl_ms`` / ``cache_scope`` are
     the server's ``tools/list`` SEP-2549 hints; ``written_at`` anchors TTL expiry."""
     entry = {"fingerprint": fingerprint, "tools": tools, "utility_tools": utility_tools or []}
-    if isinstance(ttl_ms, (int, float)):
+    # SEP-2549: a server MAY advertise ttlMs. The MCP SDK models the field with default 0, so a
+    # synthesized 0 is indistinguishable from "no hint given". Storing it would make the entry
+    # expire the instant it is written (elapsed >= 0), permanently defeating `lazy: true`. Only a
+    # positive TTL is a usable hint.
+    if _is_real_ttl(ttl_ms):
         entry["ttl_ms"] = ttl_ms
         entry["written_at"] = time.time()
     if cache_scope:
