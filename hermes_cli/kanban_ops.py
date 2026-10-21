@@ -215,7 +215,10 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
 
     def _on_tick(res):
         ready_pending = bool(res.skipped_unassigned) or _ready_queue_nonempty()
-        if ready_pending and not res.spawned:
+        # Same predicate as the embedded gateway dispatcher. The CLI daemon
+        # carried its own copy of the bad-tick logic and was missed by the
+        # first fix, so the two sites could disagree about the same tick.
+        if kbd.tick_is_stuck([res], ready_pending, bool(res.spawned)):
             health_state["bad_ticks"] += 1
         else:
             health_state["bad_ticks"] = 0

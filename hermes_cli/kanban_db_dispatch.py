@@ -161,6 +161,54 @@ class DispatchResult:
     "dispatcher stuck" health check can tell "at capacity" from "stuck"."""
 
 
+def tick_is_stuck(results: Iterable[Optional[DispatchResult]], ready_pending: bool, any_spawned: bool) -> bool:
+    """Is this dispatch tick genuinely STUCK (ready work that could have spawned)?
+
+    A ready queue held back because the assignee is already at
+    ``kanban.max_in_progress_per_profile``, or because the HOST is already at
+    ``kanban.max_in_progress``, is CORRECTLY IDLE, not stuck: the slot frees on
+    a later tick. Counting that as a bad tick raised a false "dispatcher
+    stuck" alarm on every tick a lane was busy (43 warnings in 24h on a host
+    with one gate lane). A tick only counts as stuck when ready work was held
+    back for a reason that is NOT a legitimate deferral.
+
+    Legitimate deferrals: the per-profile cap, the host-wide
+    ``kanban.max_in_progress`` cap, a control-plane lane that is never
+    spawnable, a task that got the default assignee applied.
+    Real holds: the respawn guard, a provider rate limit, memory pressure.
+
+    Lives here, next to :func:`describe_suppression`, because BOTH health
+    checks need it: the embedded gateway dispatcher
+    (``gateway/kanban_watchers.py``) and the CLI daemon
+    (``hermes_cli/kanban_ops.py``). The CLI daemon carried its own copy of
+    the bad-tick logic and was missed by the first fix.
+    """
+    if not ready_pending or any_spawned:
+        return False
+    legit_buckets = (
+        "skipped_per_profile_capped",
+        "skipped_nonspawnable",
+        "auto_assigned_default",
+    )
+    hold_buckets = (
+        "respawn_guarded",
+        "rate_limited",
+        "memory_pressure",
+    )
+    legitimately_deferred = any(
+        any(getattr(res, b, None) for b in legit_buckets)
+        or getattr(res, "host_capped", None) is not None
+        for res in results
+        if res is not None
+    )
+    other_hold = any(
+        any(getattr(res, b, None) for b in hold_buckets)
+        for res in results
+        if res is not None
+    )
+    return not (legitimately_deferred and not other_hold)
+
+
 def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
     """One line naming why the tick(s) held ready work back, or ``""``.
 
@@ -185,7 +233,15 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
                 counts.get("per_profile_capped", 0) + len(res.skipped_per_profile_capped)
             )
         if res.host_capped is not None:
-            counts["host_capped"] = res.host_capped
+            # host_capped is a count of RUNNING WORKERS, not of deferred tasks
+            # like every sibling key - so it is named apart and combined with
+            # max(), not summed. It is the same host on every board, so the
+            # maximum across boards is the meaningful figure, and assigning
+            # instead of accumulating would let the last board overwrite the
+            # others.
+            counts["host_capped_running"] = max(
+                counts.get("host_capped_running", 0), res.host_capped
+            )
         if res.skipped_locked:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
         if res.memory_pressure:

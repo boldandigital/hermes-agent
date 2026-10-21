@@ -330,41 +330,17 @@ def _default_profile_secret_scope():
 def _tick_is_stuck(results: Optional[list], ready_pending: bool, any_spawned: bool) -> bool:
     """Is this dispatch tick genuinely STUCK (ready work that could have spawned)?
 
-    A ready queue held back because the assignee is already at
-    ``kanban.max_in_progress_per_profile`` is CORRECTLY IDLE, not stuck: the
-    profile slot frees on a later tick. Counting that as a bad tick raised a
-    false "dispatcher stuck" alarm on every tick a single-profile lane was
-    busy (43 warnings in 24h on a host with one gate lane). A tick only
-    counts as stuck when ready work was held back for a reason that is NOT a
-    legitimate deferral.
-
-    Legitimate deferrals: the per-profile cap, the host-wide
-    ``kanban.max_in_progress`` cap, a control-plane lane that is never
-    spawnable, a task that got the default assignee applied.
-    Real holds: the respawn guard, a provider rate limit, memory pressure.
+    Delegates to the shared predicate in ``hermes_cli.kanban_db_dispatch`` so
+    the embedded gateway dispatcher and the CLI daemon
+    (``hermes_cli/kanban_ops.py``) can never disagree about the same tick.
     """
-    if not ready_pending or any_spawned:
-        return False
-    legit_buckets = (
-        "skipped_per_profile_capped",
-        "skipped_nonspawnable",
-        "auto_assigned_default",
+    from hermes_cli.kanban_db_dispatch import tick_is_stuck
+
+    return tick_is_stuck(
+        (res for _slug, res in (results or []) if res is not None),
+        ready_pending,
+        any_spawned,
     )
-    hold_buckets = (
-        "respawn_guarded",
-        "rate_limited",
-        "memory_pressure",
-    )
-    legitimately_deferred = any(
-        any(getattr(res, b, None) for b in legit_buckets)
-        or getattr(res, "host_capped", None) is not None
-        for _slug, res in (results or []) if res is not None
-    )
-    other_hold = any(
-        any(getattr(res, b, None) for b in hold_buckets)
-        for _slug, res in (results or []) if res is not None
-    )
-    return not (legitimately_deferred and not other_hold)
 
 
 def _log_spawn_results(results: Optional[list]) -> bool:
