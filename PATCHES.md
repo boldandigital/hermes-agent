@@ -208,10 +208,17 @@ fix proves nothing:
 | toolaria obsolete warning suppressed | the registry probe is reenabled |
 
 All seven pass with the patches applied. The committed pytest
-`tests/hermes_cli/test_tick_is_stuck.py` adds 15 more cases (including
-the four F1 "deferral-plus-hold" generator-fed variants that gate's run
-caught), so the F1 regression is now nailed down at suite time rather
-than at review time.
+`tests/hermes_cli/test_tick_is_stuck.py` adds 20 cases. Gate's re-verdict
+card `t_3ea1c917` returned **SHIP** with one non-blocking finding: the
+first version of the matrix self-normalised — any legit bucket other than
+`skipped_per_profile_capped` fell through a branch that DROPPED the
+deferral bucket, turning those rows into hold-alone cases that pass with
+or without the fix, and the two-result case ordered the deferral first so
+the first `any()` short-circuited before consuming the hold. The matrix
+now carries a real deferral on every row, orders the hold FIRST (the
+order in which the generator is actually exhausted), and covers all
+3 legit buckets x 3 hold buckets. Stripping the materialisation now fails
+**12 of the 20** tests, up from 4 — every matrix row bites.
 
 Existing suites: the host plugin's `sdk-only` and `regression`
 collections report **17/17** with the patches applied (verified before
@@ -219,6 +226,12 @@ the cleanup touched their plugin — they exercise the same surface).
 The dispatch/catalog/copilot pytest subset produces an **identical**
 failure set with and without the patch (1 failed / 17 passed both ways)
 — no regression in the affected subset.
+
+**Run the tests with the venv's own interpreter** (`.venv/bin/python`,
+Python 3.14.7) — not a system `python3.11` against the 3.11
+site-packages, which `uv sync` has correctly pruned (`ruamel-yaml` is a
+`python_full_version >= '3.14'` dependency in `uv.lock`, so the 3.11 tree
+does not carry it and `hermes_yaml.py` cannot import there).
 
 **Note on the `tier` claim (gate's F4).** `tier` is display-only for
 `entry_from_mapping` — the site that was failing — and for the picker.
