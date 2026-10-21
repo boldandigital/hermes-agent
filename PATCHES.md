@@ -113,3 +113,67 @@ The local patch survives `hermes update` because it lives on this
 branch and the updater merges `origin/main` into the parked branch in
 place; the patch commit is preserved as a real commit on the
 fast-forward / merge target.
+
+### `fix/error-log-noise-20261021` — three upstream mismatches produced ~900 warnings/day
+
+**Symptom.** A 24h census of `~/.hermes/logs/errors.log` found 1259 lines.
+~900 of them were three unrelated warnings repeating, which buried the
+signals that were real. None of the three is a functional bug; all three
+are the local build disagreeing with upstream.
+
+| # | Warning | Per 24h | Root cause |
+|---|---|---|---|
+| 1 | `tier must be one of official/community (got 'verified')` | 256 | The live catalog now ships a `verified` tier; this build hard-rejects it |
+| 2 | `Token from GITHUB_TOKEN is not supported: Classic PAT…` | 329 | `resolve_copilot_token()` revalidates on every status/picker call |
+| 3 | `kanban dispatcher stuck: ready queue non-empty … 0 workers spawned` | 43 | The health check never consulted the per-profile cap bucket |
+
+**1 — catalog tier.** The live catalog holds 760 entries: 741 `community`,
+15 `official`, 4 `verified` (`cua-spaces`, `nvidia-app`, `nvidia-broadcast`,
+`tinyfish`). `entry_from_mapping` rejected the four and dropped them from
+the picker. `tier` is display-only in `hermes_cli/plugin_catalog.py` — it
+never gates installation or trust — so `CATALOG_TIERS` now accepts
+`verified` and the four plugins return to the picker.
+
+**2 — copilot warning.** `_copilot_acp_auth_evidence()` runs on every
+status endpoint and model picker, and `resolve_copilot_token()` validates
+`COPILOT_GITHUB_TOKEN` / `GH_TOKEN` / `GITHUB_TOKEN` in turn. A classic
+PAT in `GITHUB_TOKEN` is not a valid Copilot token, so the same correct
+warning fired 329 times. It is now emitted once per distinct
+`(env var, reason)` pair per process.
+
+**3 — dispatcher false positive.** `gateway/kanban_watchers.py` counted a
+tick as bad whenever the ready queue was non-empty and nothing spawned,
+then raised a "check profile health (venv, PATH, credentials)" alarm
+without ever consulting the dispatcher's own
+`skipped_per_profile_capped` bucket. With
+`kanban.max_in_progress_per_profile=1` and one gate lane, every tick the
+gate was busy looked like a stall — the alarm fired for 26 consecutive
+ticks during a legitimate review. The condition is now the testable helper
+`_tick_is_stuck()`: a queue held back only by `skipped_per_profile_capped`
+/ `skipped_nonspawnable` / `auto_assigned_default` is *correctly idle* and
+does not advance the bad-tick counter, while a respawn-guard hold, a
+provider rate limit or memory pressure still does.
+`describe_suppression()` now also names `per_profile_capped=N` so the
+remaining alarm explains itself.
+
+**Verification.** Each fix was re-broken individually and the matching test
+confirmed to FAIL, then restored — a test that passes with and without the
+fix proves nothing:
+
+| Test | Fails when |
+|---|---|
+| catalog accepts `verified` tier | `CATALOG_TIERS` is reverted |
+| copilot PAT warning emitted once | the dedupe guard is removed (5 warnings) |
+| per-profile cap is not "stuck" | `_tick_is_stuck()` returns `True` unconditionally |
+| suppression names `per_profile_capped` | the counter is removed |
+
+All four pass with the patches applied. Existing suites: copilot + catalog
+17/17, and the dispatch/catalog/copilot selection produces an IDENTICAL
+failure set with and without the patch (1 failed / 17 passed both ways) —
+no regression.
+
+**Durable mechanism.** Same parked-branch strategy as the sibling patch:
+`updates.parked_branch_strategy=update_in_place` makes `hermes update`
+merge `origin/main` into this branch in place, so the patch commit
+survives an update. Rebase onto fresh main before retesting:
+`git fetch origin main && git checkout fix/error-log-noise-20261021 && git rebase origin/main`.
