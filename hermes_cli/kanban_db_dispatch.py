@@ -174,6 +174,10 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
             counts[reason] = counts.get(reason, 0) + 1
         if res.rate_limited:
             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
+        if res.skipped_per_profile_capped:
+            counts["per_profile_capped"] = (
+                counts.get("per_profile_capped", 0) + len(res.skipped_per_profile_capped)
+            )
         if res.skipped_locked:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
         if res.memory_pressure:

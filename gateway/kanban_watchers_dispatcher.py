@@ -327,6 +327,44 @@ def _default_profile_secret_scope():
         reset_secret_scope(token)
 
 
+def _tick_is_stuck(results: Optional[list], ready_pending: bool, any_spawned: bool) -> bool:
+    """Is this dispatch tick genuinely STUCK (ready work that could have spawned)?
+
+    A ready queue held back because the assignee is already at
+    ``kanban.max_in_progress_per_profile`` is CORRECTLY IDLE, not stuck: the
+    profile slot frees on a later tick. Counting that as a bad tick raised a
+    false "dispatcher stuck" alarm on every tick a single-profile lane was
+    busy (43 warnings in 24h on a host with one gate lane). A tick only
+    counts as stuck when ready work was held back for a reason that is NOT a
+    legitimate deferral.
+
+    Legitimate deferrals: the per-profile cap, a control-plane lane that is
+    never spawnable, a task that got the default assignee applied.
+    Real holds: the respawn guard, a provider rate limit, memory pressure.
+    """
+    if not ready_pending or any_spawned:
+        return False
+    legit_buckets = (
+        "skipped_per_profile_capped",
+        "skipped_nonspawnable",
+        "auto_assigned_default",
+    )
+    hold_buckets = (
+        "respawn_guarded",
+        "rate_limited",
+        "memory_pressure",
+    )
+    legitimately_deferred = any(
+        any(getattr(res, b, None) for b in legit_buckets)
+        for _slug, res in (results or []) if res is not None
+    )
+    other_hold = any(
+        any(getattr(res, b, None) for b in hold_buckets)
+        for _slug, res in (results or []) if res is not None
+    )
+    return not (legitimately_deferred and not other_hold)
+
+
 def _log_spawn_results(results: Optional[list]) -> bool:
     """Log per-board spawn summaries; returns whether any board spawned."""
     any_spawned = False

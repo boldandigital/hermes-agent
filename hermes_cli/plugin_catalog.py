@@ -28,7 +28,12 @@ from datetime import UTC
 
 logger = logging.getLogger(__name__)
 
-CATALOG_TIERS = ("official", "community")
+# The upstream catalog now ships a third tier, "verified". Rejecting those
+# entries made every catalog fetch log one warning per verified plugin (256
+# warnings in 24h on this host) and dropped them from the picker. `tier` is
+# display-only here — it is never used to gate installation or trust — so
+# accepting the new value is safe.
+CATALOG_TIERS = ("official", "community", "verified")
 # Browse taxonomy for the catalog page / picker. Entries without one land on the Desktop shelf
 # (the common case for community submissions); "general" is for plugins that fit no shelf.
 CATALOG_CATEGORIES = ("desktop", "memory", "platform", "web", "tools", "voice", "automation", "models", "general")
