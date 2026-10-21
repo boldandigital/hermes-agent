@@ -222,6 +222,7 @@ class TestSnapshotEndToEnd:
             finally:
                 env.cleanup()
 
+        output = result.get("output", "")
         assert "FROM_PROFILE=profile-ok" in output
         assert str(fake_n_bin) in output
         # bashrc short-circuited on the interactive guard — its export never ran

@@ -31,6 +31,16 @@ _INTERPRETER_PREFIXES = tuple({
 _normcase = os.path.normcase
 _INTERPRETER_PREFIX_STRS = tuple(_normcase(os.fspath(p)) for p in _INTERPRETER_PREFIXES)
 
+# The payload manifest sits BESIDE the install tree it describes: pm probes it as
+# ``<install root>/../manifest.json`` (pm/environments.py:_payload_manifest,
+# pm/runtime.py:_resident_runtime, pm/paths.py:writable_store_root, pm/lock.py, pm/install.py).
+# In the default install the checkout IS ``~/.hermes/hermes-agent``, so that probe lands in the
+# guarded home even though the file is an install-layout marker, not Hermes state — a git install
+# never creates it. Only that one file is exempt, and only for reads; a write to it is refused.
+_PM_PAYLOAD_MANIFEST = _normcase(
+    os.fspath(Path(__file__).resolve().parent.parent.parent / "manifest.json")
+)
+
 
 def _within(path: str, prefix: str) -> bool:
     """``Path(path).is_relative_to(prefix)`` for two normalized, case-folded absolute strings."""
@@ -56,7 +66,7 @@ class HomeIOGuard:
         self.checking = threading.local()
         self.directories: dict[int, Path] = {}
 
-    def check(self, value, *, dir_fd=None, metadata=False, destructive=False):
+    def check(self, value, *, dir_fd=None, metadata=False, destructive=False, read_only=False):
         if value is None or isinstance(value, int) or getattr(self.checking, "active", False):
             return
         self.checking.active = True
@@ -100,6 +110,12 @@ class HomeIOGuard:
             for prefix in _INTERPRETER_PREFIX_STRS:
                 if _within(absolute, prefix) or (metadata and _contains(absolute, prefix)):
                     return
+            # The install tree's payload manifest is install layout, not Hermes state: pm reads
+            # ``<install root>/../manifest.json`` to detect a sealed payload, and in the default
+            # install the checkout IS ``~/.hermes/hermes-agent``, so that read lands in the
+            # guarded home. Only that one file is exempt, and only for reads.
+            if (metadata or read_only) and absolute == _PM_PAYLOAD_MANIFEST:
+                return
             # Check the lexical path first: resolving must not probe a protected
             # tree merely to decide that the original path was forbidden.
             for root in roots:
@@ -157,7 +173,7 @@ class HomeIOGuard:
         )
 
     def install(self, monkeypatch):
-        def wrap(module, name, parameters, *, metadata=False, destructive=False):
+        def wrap(module, name, parameters, *, metadata=False, destructive=False, read_only=False):
             original = getattr(module, name)
 
             @wraps(original)
@@ -165,7 +181,8 @@ class HomeIOGuard:
                 for index, (parameter, descriptor) in enumerate(parameters):
                     value = args[index] if index < len(args) else kwargs.get(parameter)
                     self.check(value, dir_fd=kwargs.get(descriptor) if descriptor else None, metadata=metadata,
-                               destructive=destructive(args, kwargs) if callable(destructive) else destructive)
+                               destructive=destructive(args, kwargs) if callable(destructive) else destructive,
+                               read_only=read_only(args, kwargs) if callable(read_only) else read_only)
                 return original(*args, **kwargs)
 
             monkeypatch.setattr(module, name, guarded)
@@ -174,8 +191,11 @@ class HomeIOGuard:
             mode = args[1] if len(args) > 1 else kwargs.get("mode", "r")
             return any(flag in mode for flag in "wax+")
 
+        def open_reads(args, kwargs):
+            return not open_writes(args, kwargs)
+
         for module in (builtins, io):
-            wrap(module, "open", (("file", None),), destructive=open_writes)
+            wrap(module, "open", (("file", None),), destructive=open_writes, read_only=open_reads)
         for name in ("mkdir", "unlink", "remove", "rmdir", "chmod", "utime"):
             wrap(os, name, (("path", "dir_fd"),), destructive=name != "mkdir")
         for name in ("stat", "lstat", "readlink", "access"):
@@ -191,7 +211,8 @@ class HomeIOGuard:
 
         @wraps(original_open)
         def guarded_open(path, flags, *args, **kwargs):
-            self.check(path, dir_fd=kwargs.get("dir_fd"), destructive=bool(flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC)))
+            writing = bool(flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC))
+            self.check(path, dir_fd=kwargs.get("dir_fd"), destructive=writing, read_only=not writing)
             fd = original_open(path, flags, *args, **kwargs)
             candidate = Path(os.fsdecode(path))
             if kwargs.get("dir_fd") is not None and not candidate.is_absolute():

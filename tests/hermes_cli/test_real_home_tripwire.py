@@ -200,6 +200,24 @@ def test_checkout_inside_a_guarded_root_is_not_hermes_state():
         guard.check(PROJECT_ROOT.parent / "config.yaml")
 
 
+def test_the_install_trees_payload_manifest_is_layout_not_hermes_state():
+    """pm detects a sealed payload by reading ``<install root>/../manifest.json``. In the
+    default install the checkout IS ``~/.hermes/hermes-agent``, so that read lands in the
+    guarded home even though the file is an install-layout marker a git install never
+    creates. Only that one file is exempt, and only for reads; a write to it, and every
+    other sibling, stay refused."""
+    from tests.home_io_guard import HomeIOGuard
+
+    manifest = PROJECT_ROOT.parent / "manifest.json"
+    guard = HomeIOGuard(lambda: [PROJECT_ROOT.parent])
+    guard.check(manifest, metadata=True)
+    guard.check(manifest, read_only=True)
+    with pytest.raises(AssertionError, match="REAL hermes home"):
+        guard.check(manifest, destructive=True)
+    with pytest.raises(AssertionError, match="REAL hermes home"):
+        guard.check(PROJECT_ROOT.parent / "config.yaml", read_only=True)
+
+
 def test_hermes_exported_scratch_tmp_is_not_the_test_temp_root(tmp_path):
     """A Hermes-launched shell hands pytest TMPDIR=<home>/cache/scratch (tagged by
     HERMES_SCRATCH_DIR). With that home guarded, honoring it would put the session
