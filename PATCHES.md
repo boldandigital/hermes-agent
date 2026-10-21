@@ -234,3 +234,75 @@ service categories, not `platform`, so the platform list is unaffected.
 merge `origin/main` into this branch in place, so the patch commit
 survives an update. Rebase onto fresh main before retesting:
 `git fetch origin main && git checkout fix/error-log-noise-20261021 && git rebase origin/main`.
+
+### `fix/terminal-snapshot-exclude-leaked-vault` — close the rc-file credential leak
+
+**Symptom.** A routed-worker's terminal snapshot re-imported three root-vault
+credentials (`GITHUB_TOKEN`, `FIGMA_API_KEY`, `API_KEY_21ST`) sourced by
+`~/.zshrc` from the launch-profile `~/.hermes/.env` on disk. The Python-side
+`build_subprocess_env` scope scrub cannot see those re-exports — they happen
+inside the `bash -l` subprocess that builds the snapshot, reading the file
+directly from disk. The credentials were visible to every later `execute()`
+command in that terminal and to anything inheriting its env. A live
+`doer` dispatch test (card `t_d1418aa2`) proved this; the
+credential-hygiene gate raised it as the **two-layer leak caveat** in
+`CAPABILITY-MATRIX.md` and `docs/architecture/migration-plan.md`.
+
+**Root cause (proven, not theorised).** `_prepend_shell_init` (in
+`tools/environments/local.py`) inserts `source <file>` lines into the
+login-shell snapshot bootstrap whenever `terminal.shell_init_files` lists
+the user's rc files. `~/.zshrc` does `export FIGMA_API_KEY=$(grep ...
+"$HOME/.hermes/.env" ...)`. The `export -p` dump at the end of the bootstrap
+then writes those names into the snapshot file, and every later command
+sources that snapshot — `get_secret()` and the bound scope never see them
+because they were never bound.
+
+**What changes.** `tools/environments/base.py` gets a module-level
+helper `_compute_launch_vault_exclusions_for_snapshot(launch_env_keys,
+scope_keys)` returning the upper-cased sorted set difference. The class
+gets a sibling method `_snapshot_excluded_launch_vault_names` that pulls
+the launch home's `.env` and the active profile's bound scope at
+snapshot-creation time (gated by `_is_routed_home` — the launch profile
+itself returns `()` to keep its existing `~/.zshrc` semantics intact).
+`_snapshot_excluded_passthrough_names` is updated to union that set into
+`_snapshot_passthrough_names`, so the existing
+`_export_dump_excluding_session_vars` `unset` hook handles the new
+names for free. `_snapshot_passthrough_names` stays monotonic across the
+session — a name added to the exclusion set is never re-introduced.
+
+**Tests.** `tests/tools/test_local_shell_init.py` gains
+`TestSnapshotExcludesLaunchVaultNamesNotInScope` — four tests mirroring
+the existing file's shape:
+- `test_helper_returns_only_residue_minus_scope` — the helper drops
+  launch keys absent from scope, keeps scope-bound ones, ignores
+  managed-only names.
+- `test_helper_is_case_insensitive` — lowercase `.env` + uppercase
+  scope folds cleanly to `()`.
+- `test_launch_profile_target_returns_empty_exclusion` — when the
+  active `HERMES_HOME` IS the launch home, the method returns `()`
+  (the no-regression guard for default-profile terminals).
+- `test_routed_worker_zshrc_export_excluded_from_snapshot` — full-path
+  integration: fake launch `~/.hermes/.env` + routed HOME + `~/.zshrc`
+  mirroring the real leak vector; assert the three names end up in
+  the exclusion set while the scope-bound `MINIMAX_API_KEY` stays.
+
+All four pass with the patch applied; the existing three
+`TestSnapshotEndToEnd` failures in this file are pre-existing (they
+hit the live-home `manifest.json` and `home_io_guard` rejects that; the
+unmodified-branch run fails identically — verified before/after).
+
+**Verification.** The full `tests/tools/test_local_shell_init.py` diff
+is **+113 lines of test, 0 lines of source removed, 4 new tests, 9 passed,
+3 pre-existing-skips/fails unrelated.** Run:
+```
+uv run --no-sync pytest tests/tools/test_local_shell_init.py
+```
+
+**Upstream PR.** This fork patch follows the durable mechanism above.
+Once the upstream PR is opened, link it here and add a "merged"
+section; the parking continues to work even after upstream accepts it.
+
+**Durable mechanism.** Same parked-branch strategy: branch from live
+HEAD `3254bba589`, `updates.parked_branch_strategy=update_in_place`
+keeps it across `hermes update`. Rebase before retesting:
+`git fetch origin main && git checkout fix/terminal-snapshot-exclude-leaked-vault && git rebase origin/main`.
