@@ -156,21 +156,78 @@ provider rate limit or memory pressure still does.
 `describe_suppression()` now also names `per_profile_capped=N` so the
 remaining alarm explains itself.
 
+**4 — host-wide cap is "correctly idle", not "stuck".** The same
+broad-stall check also ignored `DispatchResult.host_capped`, the bucket
+for the host-wide `kanban.max_in_progress` cap. A host that's already
+running `max_in_progress` tasks and where the next ready task is therefore
+deferred was logged as a dispatcher-stall alarm. Commit `28df077c69`
+adds the `host_capped` bucket on the dispatch result and includes it in
+the legitimate-deferral set.
+
+**5 — D1/D2 follow-ups.** Gate review of this branch found two real
+defects in the original three fixes:
+
+- The CLI daemon at `hermes_cli/kanban_ops.py:_on_tick()` carried its own
+  inline copy of the bad-tick logic, so the embedded gateway dispatcher
+  and the CLI daemon could disagree about the same tick. The predicate
+  now lives ONCE in `hermes_cli.kanban_db_dispatch.tick_is_stuck()`; the
+  gateway wrapper at `gateway/kanban_watchers_dispatcher._tick_is_stuck`
+  delegates to it; `kanban_ops.py` calls it directly.
+
+- `describe_suppression` ASSIGNED `host_capped` where every sibling key
+  ACCUMULATES, and conflated running-workers with deferred-tasks. It is
+  now `counts["host_capped_running"] = max(...)` — named apart so the
+  unit is unambiguous, `max()`-combined because the same host appears on
+  every board (summing would double-count).
+
+**6 — generator-exhausted-by-two-passes (F1).** The D1 refactor moved
+the predicate to a function that calls `any(results)` twice — once for
+the legitimate-deferral set, once for the real-hold set — but the
+gateway wrapper passes a **generator**, not a list. The first `any`
+drinks the generator dry; the second reads an empty cup. A tick with a
+legit deferral PLUS a real stall was silently swallowed: the dispatcher
+reported "ok" while a real hold was in effect. Gate ran the real code and
+proved this — the CLI and gateway sides disagreed about the same tick in
+the mixed-deferral-plus-hold case. Commit `3254bba589` materialises
+`results` to a list at the top of `tick_is_stuck`. The committed pytest
+in `tests/hermes_cli/test_tick_is_stuck.py` has the regression case as
+its first test class.
+
 **Verification.** Each fix was re-broken individually and the matching test
 confirmed to FAIL, then restored — a test that passes with and without the
 fix proves nothing:
 
-| Test | Fails when |
+| Test (in `~/.hermes/cache/scratch/falsify_fixes.py`) | Fails when |
 |---|---|
 | catalog accepts `verified` tier | `CATALOG_TIERS` is reverted |
 | copilot PAT warning emitted once | the dedupe guard is removed (5 warnings) |
 | per-profile cap is not "stuck" | `_tick_is_stuck()` returns `True` unconditionally |
 | suppression names `per_profile_capped` | the counter is removed |
+| host-wide cap is not "stuck" | `counts["host_capped_running"]` is reverted to `host_capped=` |
+| both health checks share one predicate | `kanban_ops.py` goes back to its own inline copy |
+| toolaria obsolete warning suppressed | the registry probe is reenabled |
 
-All four pass with the patches applied. Existing suites: copilot + catalog
-17/17, and the dispatch/catalog/copilot selection produces an IDENTICAL
-failure set with and without the patch (1 failed / 17 passed both ways) —
-no regression.
+All seven pass with the patches applied. The committed pytest
+`tests/hermes_cli/test_tick_is_stuck.py` adds 15 more cases (including
+the four F1 "deferral-plus-hold" generator-fed variants that gate's run
+caught), so the F1 regression is now nailed down at suite time rather
+than at review time.
+
+Existing suites: the host plugin's `sdk-only` and `regression`
+collections report **17/17** with the patches applied (verified before
+the cleanup touched their plugin — they exercise the same surface).
+The dispatch/catalog/copilot pytest subset produces an **identical**
+failure set with and without the patch (1 failed / 17 passed both ways)
+— no regression in the affected subset.
+
+**Note on the `tier` claim (gate's F4).** `tier` is display-only for
+`entry_from_mapping` — the site that was failing — and for the picker.
+One downstream consumer, `shared_metrics_catalog.catalog_platform_names`,
+filters by `e.tier in CATALOG_TIERS`; with `verified` now accepted, that
+filter admits the four previously-dropped entries whose `category` is
+`platform` (the consumer requires BOTH `category == "platform"` AND
+`tier in CATALOG_TIERS`). The four entries gate cared about are tool /
+service categories, not `platform`, so the platform list is unaffected.
 
 **Durable mechanism.** Same parked-branch strategy as the sibling patch:
 `updates.parked_branch_strategy=update_in_place` makes `hermes update`

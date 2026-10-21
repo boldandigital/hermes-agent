@@ -182,7 +182,14 @@ def tick_is_stuck(results: Iterable[Optional[DispatchResult]], ready_pending: bo
     (``gateway/kanban_watchers.py``) and the CLI daemon
     (``hermes_cli/kanban_ops.py``). The CLI daemon carried its own copy of
     the bad-tick logic and was missed by the first fix.
+
+    ``results`` is read TWICE (legitimately-deferred, then other-hold), so it
+    must be materialised to a list before the reads. A generator-typed
+    caller (the gateway wrapper passes one) would be exhausted by the first
+    pass; silently swallows the second pass. Gate caught this; see
+    tests/hermes_cli/test_tick_is_stuck.py for the regression case.
     """
+    results = [r for r in results if r is not None]
     if not ready_pending or any_spawned:
         return False
     legit_buckets = (
