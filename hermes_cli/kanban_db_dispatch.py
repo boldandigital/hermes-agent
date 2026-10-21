@@ -153,6 +153,12 @@ class DispatchResult:
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
+    host_capped: Optional[int] = None
+    """Total running workers when the HOST-WIDE ``kanban.max_in_progress`` cap
+    was already reached, so this tick spawned nothing. ``None`` when the cap
+    was not the limiter. Not an operator-actionable failure: the ready task
+    is deferred, not dropped, and spawns on a later tick. Recorded so the
+    "dispatcher stuck" health check can tell "at capacity" from "stuck"."""
 
 
 def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
@@ -178,6 +184,8 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
             counts["per_profile_capped"] = (
                 counts.get("per_profile_capped", 0) + len(res.skipped_per_profile_capped)
             )
+        if res.host_capped is not None:
+            counts["host_capped"] = res.host_capped
         if res.skipped_locked:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
         if res.memory_pressure:
@@ -2239,6 +2247,12 @@ def _tick_spawn_budget(
     if max_in_progress is not None:
         total_running = running_count + count_running_tasks_other_boards(board)
         if total_running >= max_in_progress:
+            # The HOST-WIDE cap is reached. Record it so the health check can
+            # tell "correctly at capacity" apart from "stuck" - the ready task
+            # is deferred, not dropped, and is spawned on a later tick. Before
+            # this, the cap was reached silently and every tick looked like a
+            # zero-spawn stall to gateway/kanban_watchers.py.
+            result.host_capped = total_running
             return False, None
         remaining = max_in_progress - total_running
         if spawn_budget is None or spawn_budget > remaining:

@@ -338,8 +338,9 @@ def _tick_is_stuck(results: Optional[list], ready_pending: bool, any_spawned: bo
     counts as stuck when ready work was held back for a reason that is NOT a
     legitimate deferral.
 
-    Legitimate deferrals: the per-profile cap, a control-plane lane that is
-    never spawnable, a task that got the default assignee applied.
+    Legitimate deferrals: the per-profile cap, the host-wide
+    ``kanban.max_in_progress`` cap, a control-plane lane that is never
+    spawnable, a task that got the default assignee applied.
     Real holds: the respawn guard, a provider rate limit, memory pressure.
     """
     if not ready_pending or any_spawned:
@@ -356,6 +357,7 @@ def _tick_is_stuck(results: Optional[list], ready_pending: bool, any_spawned: bo
     )
     legitimately_deferred = any(
         any(getattr(res, b, None) for b in legit_buckets)
+        or getattr(res, "host_capped", None) is not None
         for _slug, res in (results or []) if res is not None
     )
     other_hold = any(
