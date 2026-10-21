@@ -316,9 +316,19 @@ def exclusive_maintenance(homes, *, purpose: str | None = None):
     held = state[2] if state is not None and not outermost else frozenset()
     previous = set(owner.homes)
     canonical = sorted({canonical_home(p) for p in homes})
-    # Held in this process already: reuse the standing reservation (no second fd, no re-flock,
-    # no record rewrite) instead of refusing our own runtime owner.
-    reused = {home for home in canonical if process_reserves(home) is not None}
+    # Held in this process already: reuse the standing RUNTIME reservation (no second fd, no
+    # re-flock, no record rewrite) instead of refusing our own runtime owner. The runtime-owner
+    # surface IS the module-level ``process_ownership`` singleton: every runtime call site
+    # (``status.py:989``, ``run_runtime.py:200``, ``tui_gateway/entry.py:285``,
+    # ``run_bootstrap.py:628``) reserves through it. A fresh ``ProfileOwnership`` constructed
+    # inside this process is a *test or sibling maintenance* holder — granting it maintenance
+    # turns a live runtime owner's refusal into a silent destructive bulk-write. Only the
+    # runtime singleton reuses; everyone else still goes through ``owner.reserve`` and gets the
+    # normal cross-process ``OwnershipConflict`` when the flock does not yield.
+    reused = {
+        home for home in canonical
+        if process_reserves(home) is process_ownership and home not in owner.homes
+    }
     fresh = [home for home in canonical if home not in reused]
     maintenance_locks = []
     try:
@@ -335,8 +345,18 @@ def exclusive_maintenance(homes, *, purpose: str | None = None):
             maintenance_locks.append((home, lock))
         if fresh:
             owner.reserve(fresh, purpose=purpose)
-        if outermost:
-            _maintenance.state = (os.getpid(), owner, held | {home for home, _ in maintenance_locks})
+        # Write the held set on EVERY frame (not only the outermost): a home first acquired at
+        # depth 2 must be visible to a depth-3 frame so the per-home ``threading.Lock`` is
+        # reused instead of being re-acquired by the same thread (``threading.Lock`` is not
+        # reentrant — ``acquire(blocking=False)`` returns False on the owning thread, which
+        # this branch would mistake for a sibling-thread contention and raise ``Busy`` against
+        # itself). ``owner`` is already shared across nested frames (``outermost=False`` keeps
+        # the parent's ``ProfileOwnership``), and ``finally`` only releases homes newly added
+        # by the current frame (``home not in previous``), so the per-frame ``maintenance_locks``
+        # list and the per-thread ``held`` union stay consistent.
+        state_held = held | {home for home, _ in maintenance_locks}
+        if outermost or state is not None:
+            _maintenance.state = (os.getpid(), owner, state_held)
         yield
     except OwnershipConflict as exc:
         if isinstance(exc, _InProcessMaintenanceBusy):
