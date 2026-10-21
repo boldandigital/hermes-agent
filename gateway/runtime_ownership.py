@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import stat
 import threading
+import weakref
 from hermes_dir_acl import make_user_dir
 
 
@@ -178,6 +179,7 @@ class ProfileOwnership:
                         handle.close()
                         raise
                     self._handles[home] = handle
+                    _register_process_reservation(home, self)
                     added.append(home)
             except BaseException:
                 for home in reversed(added):
@@ -193,6 +195,7 @@ class ProfileOwnership:
         with self._mutex:
             handle = self._handles.pop(canonical_home(home), None)
             if handle is not None:
+                _unregister_process_reservation(canonical_home(home), self)
                 _release_file_lock(handle)
                 handle.close()
 
@@ -215,6 +218,44 @@ class ProfileOwnership:
 
 process_ownership = ProfileOwnership()
 _maintenance = threading.local()
+_process_reservations_guard = threading.Lock()
+# Weak, so registering a reservation never extends that owner's life: an owner dropped
+# without release() still has its flock released by GC, and its entry disappears with it.
+_process_reservations: weakref.WeakValueDictionary[Path, ProfileOwnership] = weakref.WeakValueDictionary()
+_maintenance_locks_guard = threading.Lock()
+_maintenance_locks: dict[Path, threading.Lock] = {}
+
+
+def _register_process_reservation(home: Path, owner: ProfileOwnership) -> None:
+    with _process_reservations_guard:
+        _process_reservations[home] = owner
+
+
+def _unregister_process_reservation(home: Path, owner: ProfileOwnership) -> None:
+    with _process_reservations_guard:
+        if _process_reservations.get(home) is owner:
+            del _process_reservations[home]
+
+
+def process_reserves(home: Path) -> ProfileOwnership | None:
+    """The :class:`ProfileOwnership` in THIS process holding ``home``'s flock, else None.
+
+    ``flock`` is bound to the open file description, not the process, so a second descriptor
+    on an inode this process already holds conflicts even here. That is what makes a home an
+    in-process owner holds unusable for a fresh reservation, and why maintenance must REUSE
+    such a reservation instead of taking a second one.
+    """
+    with _process_reservations_guard:
+        return _process_reservations.get(canonical_home(home))
+
+
+def _maintenance_lock(home: Path) -> threading.Lock:
+    with _maintenance_locks_guard:
+        return _maintenance_locks.setdefault(canonical_home(home), threading.Lock())
+
+
+class _InProcessMaintenanceBusy(OwnershipConflict):
+    """A sibling maintenance step in THIS process holds the home; no other process is involved."""
 
 
 def maintenance_holder(home: Path, purpose: str) -> dict | None:
@@ -257,19 +298,50 @@ def exclusive_maintenance(homes, *, purpose: str | None = None):
     This is not an owner-presence check: the reservation remains held through
     publication, excluding startup even before its PID/control socket exists.
     Only nested synchronous maintenance in this thread may reuse a reservation;
-    being the runtime owner (even in this process) never grants maintenance.
+    another maintenance step in this process is still refused (serialised, not run twice).
     Lock inodes must not be restored, removed, or replaced by callers.
+
+    A home THIS process already owns (the gateway runtime serving its own profile, which
+    holds ``gateway.lock`` for its whole life) is REUSED, not re-reserved. ``flock`` binds to
+    the open file description, so a second descriptor on that inode conflicts even within one
+    process: before this, the owner's own session-mutation endpoints could never take the
+    lock and were refused forever, and the refusal told the operator to stop the gateway that
+    was serving the request. Reuse writes no record, so the runtime record
+    (:func:`live_runtime_owner` and gateway discovery still read it) stays true. A DIFFERENT
+    process is still refused and is still told it is a gateway.
     """
     state = getattr(_maintenance, 'state', None)
     outermost = state is None or state[0] != os.getpid()
     owner = state[1] if state is not None and not outermost else ProfileOwnership()
+    held = state[2] if state is not None and not outermost else frozenset()
     previous = set(owner.homes)
+    canonical = sorted({canonical_home(p) for p in homes})
+    # Held in this process already: reuse the standing reservation (no second fd, no re-flock,
+    # no record rewrite) instead of refusing our own runtime owner.
+    reused = {home for home in canonical if process_reserves(home) is not None}
+    fresh = [home for home in canonical if home not in reused]
+    maintenance_locks = []
     try:
-        owner.reserve(homes, purpose=purpose)
+        # Serialise maintenance in this process against itself. The flock only ever separated
+        # processes (and second descriptors); a reused reservation has no flock of its own to
+        # lose, so the thread-local reuse no longer excludes a concurrent sibling thread.
+        for home in canonical:
+            if home in held:
+                continue  # nested in this thread: the outer frame already serialises this home
+            lock = _maintenance_lock(home)
+            if not lock.acquire(blocking=False):
+                raise _InProcessMaintenanceBusy(
+                    f'another maintenance step in this process holds profile {home}')
+            maintenance_locks.append((home, lock))
+        if fresh:
+            owner.reserve(fresh, purpose=purpose)
         if outermost:
-            _maintenance.state = (os.getpid(), owner)
+            _maintenance.state = (os.getpid(), owner, held | {home for home, _ in maintenance_locks})
         yield
     except OwnershipConflict as exc:
+        if isinstance(exc, _InProcessMaintenanceBusy):
+            # No other process is involved, so "drain and stop the gateway" would be a lie.
+            raise
         raise OwnershipConflict(
             f'Exclusive maintenance refused: {exc}. Drain and stop the gateway, then retry.'
         ) from exc
@@ -277,5 +349,7 @@ def exclusive_maintenance(homes, *, purpose: str | None = None):
         for home in reversed(owner.homes):
             if home not in previous:
                 owner.release(home)
+        for _home, lock in reversed(maintenance_locks):
+            lock.release()
         if outermost:
             _maintenance.state = None
