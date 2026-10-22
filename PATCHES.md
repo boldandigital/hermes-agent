@@ -242,8 +242,59 @@ filter admits the four previously-dropped entries whose `category` is
 `tier in CATALOG_TIERS`). The four entries gate cared about are tool /
 service categories, not `platform`, so the platform list is unaffected.
 
-**Durable mechanism.** Same parked-branch strategy as the sibling patch:
+**Durable mechanism — and the two ways it silently failed (2026-10-22).**
+Same parked-branch strategy as the sibling patch:
 `updates.parked_branch_strategy=update_in_place` makes `hermes update`
-merge `origin/main` into this branch in place, so the patch commit
-survives an update. Rebase onto fresh main before retesting:
-`git fetch origin main && git checkout fix/error-log-noise-20261021 && git rebase origin/main`.
+merge `origin/main` into the checked-out branch in place, so the patch
+commits survive an update.
+
+Two failure modes killed that guarantee in practice, both now fixed:
+
+1. **`origin` was the OFFICIAL repo.** `hermes_cli/update_channel.py:
+   _tracks_official_origin()` decides the update channel from
+   `remote.origin.url`. With `origin` = `NousResearch/hermes-agent` the
+   updater followed `stable`, checked out upstream's published tree and
+   left the checkout **detached** — the fork's patches went dormant and
+   the live gateway ran unpatched upstream code. The remotes are now in
+   the standard layout: `origin` = `boldandigital/hermes-agent` (the
+   private fork), `upstream` = `NousResearch/hermes-agent`. The updater
+   now resolves `default_channel = main` and never detaches.
+
+2. **The patches were not on the fork's `main`.** `hermes_cli/
+   update_cmd_git.py` computes the parked branch as
+   `git rev-list --count origin/{target}..HEAD` — the *currently checked
+   out* branch — and `auto_switch_parked_branch` checks out `origin/main`
+   afterwards. If the fork's `main` lacks the patches, the next update
+   checks out unpatched code again. The patches now live on the fork's
+   `main`.
+
+**Where the patch ended up.** The error-log-noise branch was folded into
+`fix/gateway-self-maintenance-lock` (merge `9c7330e0e7`), then upstream
+`main` (`4d04303818`) was merged on top (merge `9593de5569`). The result
+was pushed to the private fork's `main` and to the branch itself, so
+`origin/main` = the fully patched tree. Upstream had meanwhile fixed the
+catalog tier on its own (`CATALOG_TIERS = ("official", "verified",
+"community")`), so the merge dropped that one patch as redundant and
+resolved with **zero conflicts**.
+
+**Verification against the merged tree** (upstream had touched all five
+patched files, so a textual check was not enough — every fix was
+re-falsified):
+
+| Check | Result |
+|---|---|
+| falsification harness | 7/7 pass |
+| committed pytest `test_tick_is_stuck.py` | 20/20 pass |
+| relevant subset (`test_copilot_auth.py` + the above) | 35/35 pass |
+| materialisation stripped | 12 of 20 tests FAIL (the bug bites) |
+| copilot dedupe removed | its harness test FAILS |
+| live error log after the gateway restart | all 10 tracked classes at 0 |
+
+**Known false positive, deliberately not "fixed".** The context scanner
+flags `invisible_unicode_U+200D` for `SOUL.md` because the pirate-flag
+emoji `🏴‍☠️` contains a ZERO WIDTH JOINER. It is one ZWJ inside a valid
+emoji sequence in a file Lars chose. Exempting ZWJ from
+`tools/threat_patterns.py:INVISIBLE_CHARS` would weaken a security
+control to silence one log line, and removing the flag would change the
+agent's identity. Neither is a good trade; it is left visible on purpose.
+
