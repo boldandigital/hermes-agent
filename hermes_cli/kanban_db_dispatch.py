@@ -149,6 +149,67 @@ class DispatchResult:
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
+    host_capped: Optional[int] = None
+    """Total running workers when the HOST-WIDE ``kanban.max_in_progress`` cap
+    was already reached, so this tick spawned nothing. ``None`` when the cap
+    was not the limiter. Not an operator-actionable failure: the ready task
+    is deferred, not dropped, and spawns on a later tick. Recorded so the
+    "dispatcher stuck" health check can tell "at capacity" from "stuck"."""
+
+
+def tick_is_stuck(results: Iterable[Optional[DispatchResult]], ready_pending: bool, any_spawned: bool) -> bool:
+    """Is this dispatch tick genuinely STUCK (ready work that could have spawned)?
+
+    A ready queue held back because the assignee is already at
+    ``kanban.max_in_progress_per_profile``, or because the HOST is already at
+    ``kanban.max_in_progress``, is CORRECTLY IDLE, not stuck: the slot frees on
+    a later tick. Counting that as a bad tick raised a false "dispatcher
+    stuck" alarm on every tick a lane was busy (43 warnings in 24h on a host
+    with one gate lane). A tick only counts as stuck when ready work was held
+    back for a reason that is NOT a legitimate deferral.
+
+    Legitimate deferrals: the per-profile cap, the host-wide
+    ``kanban.max_in_progress`` cap, a control-plane lane that is never
+    spawnable, a task that got the default assignee applied.
+    Real holds: the respawn guard, a provider rate limit, memory pressure.
+
+    Lives here, next to :func:`describe_suppression`, because BOTH health
+    checks need it: the embedded gateway dispatcher
+    (``gateway/kanban_watchers.py``) and the CLI daemon
+    (``hermes_cli/kanban_ops.py``). The CLI daemon carried its own copy of
+    the bad-tick logic and was missed by the first fix.
+
+    ``results`` is read TWICE (legitimately-deferred, then other-hold), so it
+    must be materialised to a list before the reads. A generator-typed
+    caller (the gateway wrapper passes one) would be exhausted by the first
+    pass; silently swallows the second pass. Gate caught this; see
+    tests/hermes_cli/test_tick_is_stuck.py for the regression case.
+    """
+    results = [r for r in results if r is not None]
+    if not ready_pending or any_spawned:
+        return False
+    legit_buckets = (
+        "skipped_per_profile_capped",
+        "skipped_nonspawnable",
+        "auto_assigned_default",
+    )
+    hold_buckets = (
+        "respawn_guarded",
+        "rate_limited",
+        "memory_pressure",
+    )
+    legitimately_deferred = any(
+        any(getattr(res, b, None) for b in legit_buckets)
+        or getattr(res, "host_capped", None) is not None
+        for res in results
+        if res is not None
+    )
+    other_hold = any(
+        any(getattr(res, b, None) for b in hold_buckets)
+        for res in results
+        if res is not None
+    )
+    return not (legitimately_deferred and not other_hold)
 
 
 def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
@@ -170,6 +231,20 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
             counts[reason] = counts.get(reason, 0) + 1
         if res.rate_limited:
             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
+        if res.skipped_per_profile_capped:
+            counts["per_profile_capped"] = (
+                counts.get("per_profile_capped", 0) + len(res.skipped_per_profile_capped)
+            )
+        if res.host_capped is not None:
+            # host_capped is a count of RUNNING WORKERS, not of deferred tasks
+            # like every sibling key - so it is named apart and combined with
+            # max(), not summed. It is the same host on every board, so the
+            # maximum across boards is the meaningful figure, and assigning
+            # instead of accumulating would let the last board overwrite the
+            # others.
+            counts["host_capped_running"] = max(
+                counts.get("host_capped_running", 0), res.host_capped
+            )
         if res.skipped_locked:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
         if res.memory_pressure:
@@ -2266,6 +2341,12 @@ def _tick_spawn_budget(
     if max_in_progress is not None:
         total_running = running_count + count_running_tasks_other_boards(board)
         if total_running >= max_in_progress:
+            # The HOST-WIDE cap is reached. Record it so the health check can
+            # tell "correctly at capacity" apart from "stuck" - the ready task
+            # is deferred, not dropped, and is spawned on a later tick. Before
+            # this, the cap was reached silently and every tick looked like a
+            # zero-spawn stall to gateway/kanban_watchers.py.
+            result.host_capped = total_running
             return False, None
         remaining = max_in_progress - total_running
         if spawn_budget is None or spawn_budget > remaining:

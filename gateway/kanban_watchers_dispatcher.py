@@ -326,6 +326,22 @@ def _default_profile_secret_scope():
         reset_secret_scope(token)
 
 
+def _tick_is_stuck(results: Optional[list], ready_pending: bool, any_spawned: bool) -> bool:
+    """Is this dispatch tick genuinely STUCK (ready work that could have spawned)?
+
+    Delegates to the shared predicate in ``hermes_cli.kanban_db_dispatch`` so
+    the embedded gateway dispatcher and the CLI daemon
+    (``hermes_cli/kanban_ops.py``) can never disagree about the same tick.
+    """
+    from hermes_cli.kanban_db_dispatch import tick_is_stuck
+
+    return tick_is_stuck(
+        (res for _slug, res in (results or []) if res is not None),
+        ready_pending,
+        any_spawned,
+    )
+
+
 def _log_spawn_results(results: Optional[list]) -> bool:
     """Log per-board spawn summaries; returns whether any board spawned."""
     any_spawned = False

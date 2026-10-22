@@ -35,6 +35,13 @@ _DEVICE_CODE_POLL_INTERVAL = 5  # seconds
 _DEVICE_CODE_POLL_SAFETY_MARGIN = 3  # seconds
 
 
+# Repeated identical warnings for the same (env var, reason) pair are noise:
+# resolve_copilot_token runs on every status/picker call, so a classic PAT in
+# GITHUB_TOKEN produced the same warning 329 times in 24h. Warn once per
+# distinct cause per process; the information is not lost, just deduplicated.
+_WARNED_TOKEN_ISSUES: set[tuple[str, str]] = set()
+
+
 def validate_copilot_token(token: str) -> tuple[bool, str]:
     """Validate that a token is usable with the Copilot API."""
     token = token.strip()
@@ -68,7 +75,10 @@ def resolve_copilot_token() -> tuple[str, str]:
         valid, msg = validate_copilot_token(val)
         if valid:
             return val, env_var
-        logger.warning("Token from %s is not supported: %s", env_var, msg)
+        issue = (env_var, msg)
+        if issue not in _WARNED_TOKEN_ISSUES:
+            _WARNED_TOKEN_ISSUES.add(issue)
+            logger.warning("Token from %s is not supported: %s", env_var, msg)
     # `gh auth token` fallback ONLY when no Copilot env var was set: an exported GITHUB_TOKEN
     # (even a classic PAT) means the user intends *that* token; skipping also avoids a slow
     # subprocess (up to 5s on Windows) on every cold start.
