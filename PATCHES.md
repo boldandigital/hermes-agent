@@ -277,9 +277,10 @@ catalog tier on its own (`CATALOG_TIERS = ("official", "verified",
 "community")`), so the merge dropped that one patch as redundant and
 resolved with **zero conflicts**.
 
-**Verification against the merged tree** (upstream had touched all five
-patched files, so a textual check was not enough — every fix was
-re-falsified):
+**Verification against the merged tree** (upstream had in fact touched
+**none** of the five patched files — the merge was conflict-free by
+*disjointness*, not by textual resolution — so every fix was still
+re-falsified against the merged tree rather than assumed intact):
 
 | Check | Result |
 |---|---|
