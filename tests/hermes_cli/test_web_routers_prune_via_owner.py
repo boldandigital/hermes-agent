@@ -14,6 +14,14 @@ import time
 from contextlib import asynccontextmanager, closing
 from types import SimpleNamespace
 
+# Import the display-dedupe chain eagerly. ``SessionDB.append_message`` reaches it lazily at
+# hermes_state_messages.py:417 ("from agent.conversation_loop import ..."), and that first import
+# walks agent/process_bootstrap -> hermes_bootstrap -> pm.environments, which reads the REAL
+# ~/.hermes/manifest.json and trips tests/home_io_guard.py:160. Loading it here, before any fixture
+# narrows HERMES_HOME, keeps the tripwire honest rather than walking it with allow_real_home_io
+# (which would disable the guard for every assertion in this module).
+import agent.conversation_loop
+
 import httpx
 import pytest
 from fastapi import FastAPI
