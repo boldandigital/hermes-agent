@@ -74,9 +74,13 @@ _PRUNE_NUM_FILTERS = (
 _PRUNE_ROW_KEYS = ("id", "source", "title", "model", "started_at", "last_active", "message_count")
 
 
-def _prune_sessions(body: SessionPrune):
-    """Delete ended sessions matching filters (mirrors `hermes sessions prune`)."""
-    from hermes_cli.config import get_hermes_home
+def _prune_filter_values(body: SessionPrune) -> dict:
+    """The owner's filter dict for a prune — the exact selection the local path makes.
+
+    ``session.prune`` rejects unknown filter names, so this stays the same key set the local
+    ``prune_sessions`` call uses: a forwarded prune and its local preview must select the
+    SAME rows, or the preview would promise rows the delete never touches.
+    """
     has_window = body.started_before is not None or body.started_after is not None
     if body.older_than_days is not None and body.older_than_days < 1 and not has_window:
         raise HTTPException(status_code=400, detail="older_than_days must be >= 1")
@@ -88,15 +92,75 @@ def _prune_sessions(body: SessionPrune):
     effective_older_than = body.older_than_days
     if has_window or (attr_filters_set and "older_than_days" not in body.model_fields_set):
         effective_older_than = None
+    return {
+        "older_than_days": effective_older_than, "started_before": body.started_before,
+        "started_after": body.started_after,
+        "archived": None if body.include_archived else False,
+        **{f: (getattr(body, f) or None) for f in _PRUNE_STR_FILTERS},
+        **{f: getattr(body, f) for f in _PRUNE_NUM_FILTERS}}
+
+
+def _profile_home(profile: Optional[str]) -> Path:
+    """The home that owns this profile's session store."""
+    from hermes_state import _default_db_path
+    return Path(_cron_profile_home(profile)[1]) if profile else Path(_default_db_path()).parent
+
+
+def _this_process_owns(home: Path) -> bool:
+    """Whether THIS process holds the runtime reservation for *home* (we are its owner).
+
+    Only the module-level runtime singleton counts: a fresh reservation taken inside this
+    process is a maintenance holder, not the owner (``exclusive_maintenance`` refuses those
+    too, so the two answers agree).
+    """
+    from gateway.runtime_ownership import process_ownership, process_reserves
+    return process_reserves(home) is process_ownership
+
+
+async def _discover_owner(home: Path):
+    """The live owner of *home*, discovered read-only (never starts a gateway)."""
+    from hermes_cli.gateway_runtime import discover_gateway_endpoint
+    discovery = await asyncio.to_thread(discover_gateway_endpoint, home, timeout=1.5)
+    return getattr(discovery, "endpoint", None)
+
+
+def _count_open_prune_matches(profile: Optional[str], filters: dict) -> int:
+    """Open sessions the same filters skip — the preview's number, read-only."""
+    db = _open_session_db_for_profile(profile, read_only=True)
+    try:
+        return db.count_open_prune_matches(**filters)
+    finally:
+        db.close()
+
+
+def _prune_subject(request: Request) -> Optional[str]:
+    """The principal the owner's ticket names, when the owner accepts that name.
+
+    Best effort on purpose: a bulk prune is store-wide and operator-gated, so the caller's
+    identity never changes what it deletes. An unnamed ticket simply acts as the control
+    socket's own verified peer, and a principal detail must never refuse the prune.
+    """
+    native = getattr(request.state, "native_http_principal", None)
+    session = getattr(request.state, "session", None)
+    if native is not None:
+        subject = native.get("subject")
+    elif session is not None:
+        from gateway.session_identity import authenticated_subject
+        subject = authenticated_subject({"user_id": session.user_id,
+            "provider": session.provider, "issuer": session.issuer})
+    else:
+        return None
+    from gateway.session_identity import parse_authenticated_subject
+    return subject if parse_authenticated_subject(subject) is not None else None
+
+
+def _prune_sessions(body: SessionPrune):
+    """Delete ended sessions matching filters (mirrors `hermes sessions prune`)."""
+    from hermes_cli.config import get_hermes_home
+    filters = _prune_filter_values(body)
     profile_home = _cron_profile_home(body.profile)[1] if body.profile else get_hermes_home()
     db = _open_session_db_for_profile(body.profile, read_only=body.dry_run)
     try:
-        filters = {
-            "older_than_days": effective_older_than, "started_before": body.started_before,
-            "started_after": body.started_after,
-            "archived": None if body.include_archived else False,
-            **{f: (getattr(body, f) or None) for f in _PRUNE_STR_FILTERS},
-            **{f: getattr(body, f) for f in _PRUNE_NUM_FILTERS}}
         skipped_open = db.count_open_prune_matches(**filters)
         if body.dry_run:
             # Same whole-lineage selection prune_sessions applies, so the preview lists what it deletes.
@@ -119,6 +183,59 @@ def _prune_sessions(body: SessionPrune):
         return {"ok": True, "removed": removed, "skipped_open": skipped_open}
     finally:
         db.close()
+
+
+async def _prune_via_gateway_owner(body: SessionPrune, request: Request) -> Optional[dict]:
+    """Hand the bulk delete to the live owner of this home, or None when there is none.
+
+    A gateway that owns the profile holds the exclusive-maintenance reservation, so a
+    separately launched dashboard's prune could only ever answer 409 ("session write
+    refused", #138915). The owner already speaks the canonical ``session.prune`` verb, so
+    the write is handed over instead of asking for a lock it can never win. The verb is
+    store-wide and operator-gated: a bulk prune is not a per-row owner check, so a row
+    owned by another principal is deleted, not refused.
+
+    With no discoverable owner — or when THIS process is the owner — return None, so the
+    caller keeps the local path, and its guard, exactly as it was.
+    """
+    from hermes_cli.gateway_client import GatewayClientError, GatewayRPCError, connect_gateway
+    from hermes_cli.gateway_runtime_discovery import DiscoveryError
+    from hermes_cli.sessions_owner import PRUNE_RPC_TIMEOUT
+    from hermes_cli.web_server_sessions import _MUTATION_REFUSAL_STATUS
+
+    home = _profile_home(body.profile)
+    # An invalid prune is refused before anything is dialed: the forwarded call must refuse
+    # exactly like the direct one.
+    filters = _prune_filter_values(body)
+    if _this_process_owns(home):
+        # We ARE the owner: the direct path is our own write. Handing it to ourselves would
+        # be a self-RPC over our own control socket, and a draining gateway refuses its own
+        # verb while the direct path still works.
+        return None
+    endpoint = await _discover_owner(home)
+    if endpoint is None:
+        return None
+    if not getattr(endpoint, "control_home", True):
+        from dataclasses import replace
+        endpoint = replace(endpoint, control_home=str(home.expanduser().resolve()))
+    # The open-session count is the preview's number, read from the same store: the owner's
+    # verb answers with the deleted count alone, and a prune never deletes an open session.
+    skipped_open = await asyncio.to_thread(_count_open_prune_matches, body.profile, filters)
+    try:
+        async with connect_gateway(endpoint=endpoint, subject=_prune_subject(request)) as client:
+            result = await client.rpc("session.prune", _timeout=PRUNE_RPC_TIMEOUT, filters=filters)
+    except GatewayRPCError as exc:
+        # An owner verdict is a verdict: the same status the direct path would give.
+        raise HTTPException(
+            status_code=_MUTATION_REFUSAL_STATUS.get(str(exc), 409), detail=str(exc)) from exc
+    except (GatewayClientError, DiscoveryError, OSError, TimeoutError) as exc:
+        # A dial that dies on an endpoint discovery just identified is not owner-less (a slow
+        # first dial, or an owner restart between discovery and mint): the offline
+        # reservation would only lose to that same owner and answer with the bare 409 this
+        # forward exists to remove, so every transport failure is retryable.
+        raise HTTPException(status_code=503, detail="owner_unreachable") from exc
+    return {"ok": True, "removed": int((result or {}).get("deleted") or 0),
+            "skipped_open": skipped_open}
 
 
 _ACTIVE_WINDOW_S = 300
@@ -887,6 +1004,14 @@ def _owner_db_for(request: Request, profile: Optional[str]):
     return getattr(authority, "db", None)
 
 
+async def _live_owner_owns(profile: Optional[str]) -> bool:
+    """Whether a live gateway owns this profile's home — and this process is not it."""
+    home = _profile_home(profile)
+    if _this_process_owns(home):
+        return False
+    return (await _discover_owner(home)) is not None
+
+
 @manage_router.post("/api/sessions/owner-backfill")
 async def backfill_session_owner_profiles(body: SessionOwnerBackfill, request: Request):
     """Stamp legacy ``profile_name = NULL`` rows with the serving-profile identity.
@@ -911,6 +1036,16 @@ async def backfill_session_owner_profiles(body: SessionOwnerBackfill, request: R
             # A live gateway owns this store: it is the only writer (the offline maintenance lock
             # would 409 every Desktop boot), so the idempotent stamp runs on its own connection.
             stamped = await asyncio.to_thread(owner_db.backfill_null_session_profiles, stamp)
+        elif await _live_owner_owns(body.profile):
+            # A live gateway owns this store in another process (the standalone dashboard's own
+            # gateway). It is the only writer, and it runs this exact migration itself at every
+            # start (backfill_legacy_session_owners), so the offline reservation would only 409.
+            # Answer from the owner's side instead of writing behind its back.
+            stamped = 0
+            _log.info(
+                "owner-backfill: the live owner of %s owns this store and migrates legacy "
+                "NULL-owner rows at every start; the offline stamp was skipped",
+                body.profile or _cron_default_profile())
         else:
             stamped = await asyncio.to_thread(
                 _with_db, body.profile, lambda db: db.backfill_null_session_profiles(stamp),
@@ -975,13 +1110,17 @@ async def export_session_endpoint(session_id: str, profile: Optional[str] = None
 
 
 @manage_router.post("/api/sessions/prune")
-async def prune_sessions_endpoint(body: SessionPrune):
+async def prune_sessions_endpoint(body: SessionPrune, request: Request):
     """Delete ended sessions matching filters without blocking the event loop."""
     if body.dry_run:
+        # A preview is a local read: it never reaches the owner's write verb.
         return await asyncio.to_thread(_prune_sessions, body)
     # Same destructive rule as the rest of the family; a dry run deletes nothing, so it
     # keeps working unnamed (it is the preview the confirm dialog reads).
     body = body.model_copy(update={
         "profile": destructive_profile(body.profile, "POST /api/sessions/prune")})
+    owner = await _prune_via_gateway_owner(body, request)
+    if owner is not None:
+        return owner
     from hermes_cli.web_server_sessions import _with_session_maintenance
     return await asyncio.to_thread(_with_session_maintenance, body.profile, _prune_sessions, body)

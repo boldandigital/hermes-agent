@@ -250,6 +250,81 @@ _MUTATION_REFUSAL_STATUS = {'permission_denied': 403, 'profile_mismatch': 403, '
                             'invalid_params': 400, 'runtime_draining': 503, 'storage_unavailable': 503}
 
 
+async def _discover_gateway_owner(profile):
+    """The ready owner endpoint serving *profile*'s home, else None.
+
+    Discovery is read-only and never starts a gateway: a home with no owner answers
+    "absent", so the caller can take the local path instead.
+    """
+    from hermes_cli.gateway_runtime import discover_gateway_endpoint
+    from hermes_cli.web_server_cron import _cron_profile_home
+    from hermes_state import _default_db_path
+
+    home = Path(_cron_profile_home(profile)[1]) if profile else Path(_default_db_path()).parent
+    discovery = await asyncio.to_thread(discover_gateway_endpoint, home, timeout=1.5)
+    endpoint = getattr(discovery, 'endpoint', None)
+    if endpoint is None:
+        return None
+    if not getattr(endpoint, 'control_home', True):
+        # The selected home answered on its own socket (a multiplexer-served profile already
+        # names the multiplexer root). Pin it, so the ticket is minted on the socket that just
+        # identified as this profile's owner, never on the dashboard launch home's.
+        from dataclasses import replace
+        endpoint = replace(endpoint, control_home=str(home.expanduser().resolve()))
+    return endpoint
+
+
+def _count_open_prune_matches(profile, filters):
+    """The open rows a matching prune leaves alone, counted on a read-only view of the store."""
+    db = _open_session_db_for_profile(profile, read_only=True)
+    try:
+        return int(db.count_open_prune_matches(**filters))
+    finally:
+        db.close()
+
+
+async def _prune_via_gateway_owner(profile, filters):
+    """Forward a bulk prune to the live gateway owner.
+
+    A gateway that owns the profile holds the exclusive-maintenance reservation, so a
+    separately launched dashboard is not the store owner and its bulk prune can never win
+    that lock: every non-dry-run prune died on a bare 409 (#138915). The owner already
+    speaks the canonical ``session.prune`` verb, so the write is handed over instead of
+    fought for.
+
+    The verb is store-wide and operator-gated: it never compares a row's stored owner
+    (that is the single-session ``session.mutate`` rule), so the cold, stored rows a
+    dashboard account owns are deleted rather than refused.
+
+    Returns the answer the direct path returns, or None when no owner is discoverable so
+    the caller falls back to the local path. A transport failure is not a verdict: it
+    surfaces a retryable 503, exactly like the mutation forward.
+    """
+    from fastapi import HTTPException
+    from hermes_cli.gateway_client import GatewayClientError, GatewayRPCError
+    from hermes_cli.gateway_runtime_discovery import DiscoveryError
+    from hermes_cli.sessions_owner import owner_prune_async
+
+    endpoint = await _discover_gateway_owner(profile)
+    if endpoint is None:
+        return None
+    # The direct path counts the open rows the prune leaves alone before it deletes; a prune
+    # never deletes an open row, so the same count describes the owner's work. Counted first:
+    # a store that cannot be read must not be deleted through.
+    skipped_open = await asyncio.to_thread(_count_open_prune_matches, profile, filters)
+    try:
+        result = await owner_prune_async(endpoint, filters=filters)
+    except GatewayRPCError as exc:
+        # The owner's own refusal frame: a verdict the caller maps to the direct path's status.
+        raise HTTPException(status_code=_MUTATION_REFUSAL_STATUS.get(str(exc), 409),
+                            detail=str(exc)) from exc
+    except (GatewayClientError, DiscoveryError, OSError, TimeoutError) as exc:
+        # Transport, not a verdict: the offline reservation would only lose to that same
+        # owner and answer with the bare 409 this forward exists to remove.
+        raise HTTPException(status_code=503, detail='owner_unreachable') from exc
+    return {"ok": True, "removed": int(result.get('deleted') or 0), "skipped_open": skipped_open}
+
+
 async def _mutate_session_request(request, profile, session_id, *, request_id,
                                   expected_revision, operation, payload, expected_generation=None):
     """Resolve the authenticated principal and owner; never open a second writer."""

@@ -21,15 +21,24 @@ def live_owner():
     return found.endpoint if found.state == "ready" else None
 
 
+async def owner_prune_async(endpoint, **params) -> dict:
+    """Run one ``session.prune`` on *endpoint*; raises ``GatewayClientError`` on refusal/loss.
+
+    The awaitable half of :func:`owner_prune`, for callers that already run inside an
+    event loop (the dashboard's HTTP routes): the same canonical verb and the same
+    ``PRUNE_RPC_TIMEOUT`` budget, so both writers prune the way the CLI does.
+    """
+    from hermes_cli.gateway_client import connect_gateway
+
+    async with connect_gateway(endpoint) as client:
+        return await client.rpc("session.prune", _timeout=PRUNE_RPC_TIMEOUT, **params)
+
+
 def owner_prune(endpoint, **params) -> dict:
     """Run one ``session.prune`` on *endpoint*; raises ``GatewayClientError`` on refusal/loss."""
     import asyncio
-    from hermes_cli.gateway_client import connect_gateway
 
-    async def _run():
-        async with connect_gateway(endpoint) as client:
-            return await client.rpc("session.prune", _timeout=PRUNE_RPC_TIMEOUT, **params)
-    return asyncio.run(_run())
+    return asyncio.run(owner_prune_async(endpoint, **params))
 
 
 def report_owner_failure(exc) -> int:
