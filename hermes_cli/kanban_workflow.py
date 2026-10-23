@@ -140,3 +140,10 @@ DEFAULT_WORKFLOW.validate()
 
 # Every value ``tasks.status`` can hold under the default workflow.
 DEFAULT_STATUSES = frozenset(DEFAULT_WORKFLOW.keys()) | {ARCHIVED}
+
+# Terminal states: a card in one of them is finished work — nothing dispatches
+# from it and no worker owns it any more, so it is safe to hard-delete from the
+# board. ``ARCHIVED`` is the reserved terminal column; ``done`` is the default
+# workflow's finished column. A board-defined custom column is NOT terminal:
+# an unknown status fails safe (refused, never deleted).
+TERMINAL_STATUSES = frozenset({"done", ARCHIVED})

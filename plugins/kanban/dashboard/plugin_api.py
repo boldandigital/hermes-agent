@@ -718,9 +718,19 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
 
 @router.delete("/tasks/{task_id}")
 def delete_task(task_id: str, board: Optional[str] = Query(None)):
+    """Hard-delete a card. Only a TERMINAL card (done/archived) may be deleted.
+
+    A card in a live state (running/ready/review/todo/blocked, or a
+    board-defined custom column) is REFUSED with 409: deleting it destroys the
+    work its worker is still producing and orphans the worker process, which
+    keeps pushing work against a task row that no longer exists (#76196). The
+    operator archives the card first — archiving stops its worker — and then
+    deletes it: two deliberate actions, like the CLI purge path.
+    """
     with _board_conn(board) as (board, conn):
-        if not kanban_db.delete_task(conn, task_id):
-            raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        with _map_errors(409, kanban_db.TaskNotDeletableError):
+            if not kanban_db.delete_task(conn, task_id):
+                raise HTTPException(status_code=404, detail=f"task {task_id} not found")
         return {"deleted": True, "task_id": task_id}
 
 

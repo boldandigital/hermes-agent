@@ -29,7 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
-from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
+from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES, TERMINAL_STATUSES
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
@@ -3854,13 +3854,118 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         return cur.rowcount == 1
 
 
-def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Hard-delete a task and its related rows in one txn; False when not found."""
+class TaskNotDeletableError(RuntimeError):
+    """Raised when a hard delete is refused because the card is not terminal.
+
+    A card in a non-terminal state (running / ready / review / todo / blocked,
+    or any board-defined custom column) can still be dispatched, and it may
+    still own a live worker. Hard-deleting it destroys work in flight and
+    orphans the worker process, which keeps executing against a task row that
+    no longer exists (#76196: the dashboard DELETE route deleted the running
+    card t_0319ba4b on 2026-10-23, destroying the gate worker's 10k-char
+    verdict; the watchdog's tombstone trigger then made the id unrestorable).
+
+    The caller surfaces this as HTTP 409 so the operator can archive the card
+    first — the deliberate second action — and then delete it.
+    """
+
+    def __init__(self, task_id: str, status: str):
+        super().__init__(
+            f"task {task_id} is {status!r} and cannot be deleted: it is not a "
+            f"terminal state (done/archived). Archive it first — archiving stops "
+            f"its worker — then delete it."
+        )
+        self.task_id = task_id
+        self.status = status
+
+
+def _delete_worker_evidence(
+    conn: sqlite3.Connection, task_id: str,
+) -> list[tuple[int, Optional[str], Any]]:
+    """Worker evidence (pid, claim_lock, worker_started_at) for a card about to
+    be hard-deleted.
+
+    Two sources, both inside the caller's txn so the snapshot is consistent with
+    the delete it gates:
+
+    * ``tasks.worker_pid`` — the live claim of a card that is *running* now.
+    * the closed ``task_runs`` rows — a worker that outlived its own terminal
+      transition (``kanban_complete`` cleared ``tasks.worker_pid`` but the run
+      row keeps the pid + spawn fingerprint as the only evidence of the OS
+      process, #111791).
+
+    Deleting the card destroys that evidence, so the worker would never be
+    reaped and would keep running against a task nothing tracks anymore.
+    """
+    out: list[tuple[int, Optional[str], Any]] = []
+    row = conn.execute(
+        "SELECT worker_pid, claim_lock, worker_started_at FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row and row["worker_pid"]:
+        out.append((int(row["worker_pid"]), row["claim_lock"], row["worker_started_at"]))
+    for r in conn.execute(
+        "SELECT worker_pid, claim_lock, worker_started_at FROM task_runs "
+        "WHERE task_id = ? AND worker_pid IS NOT NULL", (task_id,),
+    ).fetchall():
+        out.append((int(r["worker_pid"]), r["claim_lock"], r["worker_started_at"]))
+    # Dedupe: the same worker can appear on the task row and on its run row.
+    seen: set[tuple[int, Any]] = set()
+    unique: list[tuple[int, Optional[str], Any]] = []
+    for pid, lock, started in out:
+        key = (pid, started)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append((pid, lock, started))
+    return unique
+
+
+def delete_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> bool:
+    """Hard-delete a TERMINAL task (+ related rows); False when not found.
+
+    A card that is not terminal (running / ready / review / todo / blocked, or
+    any board-defined custom column) is REFUSED with
+    :class:`TaskNotDeletableError`: deleting a live card destroys the work its
+    worker is still producing and orphans the worker process, which keeps
+    pushing work against a task row that no longer exists (#76196 — the
+    dashboard DELETE route deleted the running card t_0319ba4b on 2026-10-23
+    and the watchdog's tombstone trigger made the id unrestorable). Upstream
+    carries the same unguarded body, so this is a live upstream defect, not a
+    fork regression.
+
+    A card that IS terminal may still own a live worker (its own claim, or a
+    worker that outlived its terminal transition). That worker is terminated
+    the way :func:`archive_task` does it: the pid + claim + spawn fingerprint
+    are snapshotted INSIDE the write txn so the kill is contingent on THIS
+    caller winning the delete (a losing concurrent deleter must never signal
+    the pid), the kill runs after the commit (``_poll_worker_exit`` can wait
+    ~5 s and must not hold the write lock), and the outcome lands as its own
+    ``delete_worker_termination`` event so the delete stays atomic.
+    """
     with write_txn(conn):
+        status = _task_status(conn, task_id)
+        if status is None:
+            return False
+        if status not in TERMINAL_STATUSES:
+            # Fail safe: an unknown / custom column status is not terminal.
+            raise TaskNotDeletableError(task_id, status)
+        workers = _delete_worker_evidence(conn, task_id)
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False
         _delete_task_relations(conn, task_id)
+    # Post-commit: the card row (and its run rows) are gone, so the worker
+    # evidence is destroyed — terminate the worker now, before it can push more
+    # work into a task nothing tracks. Safe here because the deleted card was
+    # terminal: no dispatcher can spawn a duplicate worker off the released
+    # claim.
+    for pid, claim_lock, worker_started_at in workers:
+        termination = _terminate_reclaimed_worker(
+            pid, claim_lock, signal_fn=signal_fn, started_at=worker_started_at,
+        )
+        with write_txn(conn):
+            _append_event(conn, task_id, "delete_worker_termination", termination)
     recompute_ready(conn)
     return True
 
