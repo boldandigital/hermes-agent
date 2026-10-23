@@ -1911,14 +1911,23 @@ def review_dispatch_enabled() -> bool:
 # tick (``_memory_pressure_level``) because a static cap can't see other
 # tenants. Both fail open: non-Linux / read error → no cap / "unknown".
 
-# Assumed per-worker footprint for the derived cap; deliberately conservative
+# Per-worker memory assumption for the derived cap; deliberately conservative
 # so the cap errs toward fewer workers on small VMs.
 MEMORY_GUARD_MB_PER_WORKER = 512
 
-# Derived default bounds: never below 2 (smallest VM must still progress),
+# Derived default bounds: never below 2 (smallest VM must still make progress),
 # never above 8 (more fan-out must be explicit in config).
 DERIVED_MAX_IN_PROGRESS_FLOOR = 2
 DERIVED_MAX_IN_PROGRESS_CEILING = 8
+
+# A memory-pressure reading below this fraction of total RAM is treated as an
+# implausible reading rather than a real emergency. Rationale: a sampler bug
+# that reports a near-zero available figure would otherwise classify as
+# "critical" and freeze dispatch for EVERY profile, with no way to recover
+# except fixing the sampler. Real memory emergencies still show up as a low
+# absolute figure, and the absolute thresholds (64 MiB / 128 MiB) still apply
+# to the remaining headroom.
+MEMORY_GUARD_MIN_AVAILABLE_FRACTION = 0.02
 
 
 def _system_memory_sample() -> dict:
@@ -1936,17 +1945,32 @@ def _system_memory_sample() -> dict:
 
 
 def derive_default_max_in_progress(sample: Optional[Mapping[str, Any]] = None) -> Optional[int]:
-    """Memory-derived default for ``kanban.max_in_progress`` when unset:
-    ``clamp(MemTotal / MEMORY_GUARD_MB_PER_WORKER, FLOOR, CEILING)``. Returns
-    ``None`` (no cap) when total memory is unknown, so macOS/Windows dev
-    machines are unaffected.
+    """Memory-derived default for ``kanban.max_in_progress`` when unset.
+
+    Derived from memory **available to workers**, not from total RAM. Total RAM
+    overstates the budget: the OS, the desktop app, the browser and any
+    co-tenant VM are not available to a worker. On an 8 GiB host with ~1.5 GiB
+    genuinely available this yields 2 instead of 8, which matches the
+    concurrency this fleet is measured at.
+
+    ``mem_available_kib`` is the input. When it is absent — a platform with no
+    sampler, or a sample that only carries total RAM — this falls back to
+    ``mem_total_kib`` so the pre-existing behaviour (and its incident
+    coverage) is preserved rather than silently dropped.
+
+    Returns ``None`` (no cap) when neither figure is usable, so a platform
+    without a sampler is unaffected.
     """
     if sample is None:
         sample = _system_memory_sample()
-    total_kib = sample.get("mem_total_kib")
-    if isinstance(total_kib, bool) or not isinstance(total_kib, int) or total_kib <= 0:
+    available_kib = sample.get("mem_available_kib")
+    if isinstance(available_kib, bool) or not isinstance(available_kib, int) or available_kib <= 0:
+        # No available figure: fall back to total RAM (pre-existing behaviour).
+        available_kib = sample.get("mem_total_kib")
+    if isinstance(available_kib, bool) or not isinstance(available_kib, int) or available_kib <= 0:
         return None
-    workers = (total_kib // 1024) // MEMORY_GUARD_MB_PER_WORKER
+    available_mb = available_kib // 1024
+    workers = available_mb // MEMORY_GUARD_MB_PER_WORKER
     return max(DERIVED_MAX_IN_PROGRESS_FLOOR, min(workers, DERIVED_MAX_IN_PROGRESS_CEILING))
 
 
@@ -2048,7 +2072,18 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
         return "unknown"
     try:
         from gateway.memory_status import classify_pressure
-        return classify_pressure(sample.get("mem_available_kib"), sample.get("mem_total_kib"))
+        available = sample.get("mem_available_kib")
+        total = sample.get("mem_total_kib")
+        # Reject an implausible reading instead of freezing the whole fleet on it.
+        if isinstance(available, int) and not isinstance(available, bool) \
+                and isinstance(total, int) and not isinstance(total, bool) and total > 0:
+            if available / total < MEMORY_GUARD_MIN_AVAILABLE_FRACTION:
+                _kb._log.warning(
+                    "kanban dispatch: memory sample looks implausible "
+                    "(%s/%s KiB available); treating pressure as unknown", available, total
+                )
+                return "unknown"
+        return classify_pressure(available, total)
     except Exception:
         return "unknown"
 

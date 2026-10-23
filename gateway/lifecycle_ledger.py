@@ -14,7 +14,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sqlite3
+import subprocess
+import sys
 import time
 from contextlib import closing
 from datetime import datetime, timezone, UTC
@@ -61,9 +64,68 @@ def _proc_fields(path: str, wanted: dict[str, str]) -> dict[str, int]:
     return found
 
 
+def parse_vm_stat(text: str) -> tuple[int, dict[str, int]]:
+    """Parse ``vm_stat`` output -> (page_size_bytes, {page_name: count}).
+
+    Pure: takes the text so tests never shell out. Darwin's ``vm_stat`` prints
+    a header carrying the page size, then one ``Pages <name>: <count>.`` line
+    per counter. Names may contain spaces ("wired down", "occupied by
+    compressor"), so the split is on the LAST colon.
+    """
+    page_size = 4096
+    counts: dict[str, int] = {}
+    for line in text.splitlines():
+        head = line.strip()
+        if head.startswith("Mach Virtual Memory Statistics"):
+            match = re.search(r"page size of (\d+) bytes", head)
+            if match:
+                page_size = int(match.group(1))
+            continue
+        match = re.match(r"Pages\s+(.+?):\s+(\d+)\.?\s*$", head)
+        if match:
+            counts[match.group(1).strip()] = int(match.group(2))
+    return page_size, counts
+
+
+def darwin_available_kib(counts: dict[str, int], *, page_size: int = 4096) -> int:
+    """Reclaimable memory on Darwin, in KiB — the honest analog of MemAvailable.
+
+    macOS does not publish MemAvailable. The reclaimable set is free +
+    speculative + purgeable + inactive: inactive pages are file-backed and are
+    reclaimed under pressure. active and wired pages are NOT reclaimable and
+    are deliberately excluded.
+
+    Counting only free+speculative+purgeable reports ~65-97 MiB on an 8 GiB
+    host (0.8-1.2%), which ``classify_pressure`` reads as ``critical`` — and
+    ``critical`` freezes dispatch for every profile. Including inactive
+    reports ~1431-1720 MiB (18-21%), which reads as ``ok``.
+    """
+    reclaimable = (
+        counts.get("free", 0)
+        + counts.get("speculative", 0)
+        + counts.get("purgeable", 0)
+        + counts.get("inactive", 0)
+    )
+    return reclaimable * page_size // 1024
+
+
+def parse_sysctl_memsize(value: str) -> int:
+    """``sysctl -n hw.memsize`` bytes -> KiB. Pure; 0 when unparseable."""
+    try:
+        return int(value.strip()) // 1024
+    except (TypeError, ValueError, AttributeError):
+        return 0
+
+
 def sample_memory() -> dict[str, Any]:
-    """Cheap /proc snapshot (KiB): own RSS + MemTotal/MemAvailable + swap used.  Linux-only
-    (``{}`` elsewhere), never raises; the 30s heartbeat embeds it so OOM cycles are classifiable."""
+    """System memory snapshot (KiB): own RSS + MemTotal/MemAvailable + swap used.
+
+    Linux reads ``/proc``; macOS reads ``vm_stat`` + ``sysctl``. Returns ``{}``
+    on platforms with neither. Never raises; the 30s heartbeat embeds it so OOM
+    cycles are classifiable.
+    """
+    if sys.platform == "darwin":
+        return _darwin_memory_sample()
     sample = _proc_fields("/proc/self/status", {"VmRSS": "rss_kib"})
     mem = _proc_fields("/proc/meminfo", {"MemTotal": "mem_total_kib", "MemAvailable": "mem_available_kib",
                                          "SwapTotal": "SwapTotal", "SwapFree": "SwapFree"})
@@ -71,6 +133,36 @@ def sample_memory() -> dict[str, Any]:
     sample.update(mem)
     if swap_total is not None and swap_free is not None:
         sample["swap_used_kib"] = swap_total - swap_free
+    return sample
+
+
+def _darwin_memory_sample() -> dict[str, Any]:
+    """macOS memory sample (KiB). Uses vm_stat + sysctl; ``{}`` on failure.
+
+    The reclaimable set (free + speculative + purgeable + inactive) is reported
+    as ``mem_available_kib`` — see :func:`darwin_available_kib` for why the
+    naive free-pages-only reading would classify this host as ``critical``.
+    """
+    sample: dict[str, Any] = {}
+    try:
+        vm_stat = subprocess.run(
+            ["/usr/bin/vm_stat"], capture_output=True, text=True, timeout=5, check=False
+        )
+        page_size, counts = parse_vm_stat(vm_stat.stdout or "")
+        memsize = subprocess.run(
+            ["/usr/sbin/sysctl", "-n", "hw.memsize"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        total_kib = parse_sysctl_memsize(memsize.stdout or "")
+        if total_kib:
+            sample["mem_total_kib"] = total_kib
+        sample["mem_available_kib"] = darwin_available_kib(counts, page_size=page_size)
+    except Exception:
+        logger.debug("Failed to sample Darwin memory", exc_info=True)
+        return {}
     return sample
 
 
