@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -709,15 +710,107 @@ def test_delete_archived_task_removes_related_rows(kanban_home):
 
 
 def test_delete_task_removes_task_and_cascades(kanban_home):
+    # A card may only be hard-deleted once it is TERMINAL: the dashboard's
+    # DELETE route used to delete a card in ANY state, which destroyed the
+    # work of a live worker (the 2026-10-23 incident on card t_0319ba4b).
+    # Archive it first (the deliberate second action), then delete.
     with kbc.connect() as conn:
         t = kb.create_task(conn, title="to-delete", assignee="alice")
         kb.add_comment(conn, t, "user", "comment")
         kb.add_comment(conn, t, "user", "another")
+        kb.archive_task(conn, t)
+        assert kb.get_task(conn, t).status == "archived"
         assert kb.delete_task(conn, t)
         assert kb.get_task(conn, t) is None
         assert len(kb.list_comments(conn, t)) == 0
         assert len(kb.list_events(conn, t)) == 0
         assert len(kb.list_runs(conn, t)) == 0
+
+
+def test_delete_task_refuses_non_terminal_card(kanban_home):
+    """A card that is not terminal must NOT be hard-deleted.
+
+    Deleting a card in a live state destroys the work its worker is still
+    producing and leaves the OS process running against a task row that no
+    longer exists (#76196). The dashboard DELETE route must refuse instead.
+    """
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="live", assignee="alice")
+        kb.claim_task(conn, t)
+        assert kb.get_task(conn, t).status == "running"
+        with pytest.raises(kb.TaskNotDeletableError):
+            kb.delete_task(conn, t)
+        # The card and its history survive the refused delete.
+        assert kb.get_task(conn, t) is not None
+        assert kb.get_task(conn, t).status == "running"
+
+
+def test_delete_task_refuses_non_terminal_card_with_live_worker(kanban_home):
+    """A refused delete must leave the card AND its live worker alone.
+
+    The card still exists, so the worker still has a task to work on —
+    killing it would throw away in-flight work for nothing.
+    """
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])
+    try:
+        with kbc.connect() as conn:
+            t = kb.create_task(conn, title="live", assignee="alice")
+            kb.claim_task(conn, t)
+            kbd._set_worker_pid(conn, t, proc.pid)
+            assert kb.get_task(conn, t).worker_pid == proc.pid
+            with pytest.raises(kb.TaskNotDeletableError):
+                kb.delete_task(conn, t)
+            assert kb.get_task(conn, t) is not None
+            assert kb.get_task(conn, t).worker_pid == proc.pid
+            # The worker is still alive: its card was not taken away.
+            os.kill(proc.pid, 0)  # raises ProcessLookupError only when gone
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+
+
+def test_delete_task_terminates_live_worker_of_terminal_card(kanban_home):
+    """Deleting a TERMINAL card whose worker is still alive must terminate
+    that worker process.
+
+    Completing a card clears ``tasks.worker_pid`` but keeps the pid + spawn
+    fingerprint on the closed ``task_runs`` row — the only evidence left of the
+    OS process. The delete destroys that row, so a worker still alive would run
+    on against a task nothing tracks anymore (#76196).
+    """
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])
+    try:
+        with kbc.connect() as conn:
+            t = kb.create_task(conn, title="finished", assignee="alice")
+            kb.claim_task(conn, t)
+            kbd._set_worker_pid(conn, t, proc.pid)
+            run = kb.latest_run(conn, t)
+            kb.complete_task(conn, t, result="ok", expected_run_id=run.id)
+            assert kb.get_task(conn, t).status == "done"
+            row = conn.execute(
+                "SELECT worker_pid FROM task_runs WHERE task_id = ?", (t,),
+            ).fetchone()
+            assert row["worker_pid"] == proc.pid
+
+            assert kb.delete_task(conn, t) is True
+            assert kb.get_task(conn, t) is None
+            # The worker process is actually gone: SIGTERM killed it (the exit
+            # code proves the signal reached it, not that the pid vanished).
+            assert proc.wait(timeout=15) == -signal.SIGTERM
+            assert kb._pid_alive(proc.pid) is False
+            ev = conn.execute(
+                "SELECT payload FROM task_events "
+                "WHERE task_id = ? AND kind = 'delete_worker_termination'", (t,),
+            ).fetchone()
+            assert ev is not None
+            payload = json.loads(ev["payload"])
+            assert payload["prev_pid"] == proc.pid
+            assert payload["terminated"] is True
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
 
 
 

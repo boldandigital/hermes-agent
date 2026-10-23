@@ -436,6 +436,19 @@ def test_dashboard_reclaim_of_active_review_preserves_review_phase(client):
 
 def test_delete_task(client):
     t = client.post("/api/plugins/kanban/tasks", json={"title": "to-delete"}).json()["task"]
+    # A card in a live state is NOT hard-deletable: the dashboard DELETE route
+    # used to delete it anyway, which destroyed the work of a live worker and
+    # left the worker running against a task row that no longer existed
+    # (#76196). Refuse it with 409 and say what to do instead.
+    r = client.delete(f"/api/plugins/kanban/tasks/{t['id']}")
+    assert r.status_code == 409
+    assert "archive" in r.json()["detail"].lower()
+    assert client.get(f"/api/plugins/kanban/tasks/{t['id']}").status_code == 200
+
+    # Archive it first (the deliberate second action), then delete: that path
+    # still works and the card is gone.
+    r = client.patch(f"/api/plugins/kanban/tasks/{t['id']}", json={"status": "archived"})
+    assert r.status_code == 200
     r = client.delete(f"/api/plugins/kanban/tasks/{t['id']}")
     assert r.status_code == 200
     assert r.json()["deleted"] is True
@@ -449,6 +462,26 @@ def test_delete_task(client):
     # Gone from detail
     r = client.get(f"/api/plugins/kanban/tasks/{t['id']}")
     assert r.status_code == 404
+
+
+def test_delete_task_refuses_running_card_with_live_worker(client, kanban_home):
+    """A running card with a live worker must survive a DELETE attempt.
+
+    The dashboard's delete button used to hard-delete the card regardless of
+    status, destroying the worker's in-flight verdict (the 2026-10-23
+    incident on card t_0319ba4b) and orphaning the worker process.
+    """
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "live"}).json()["task"]
+    with kbc.connect() as conn:
+        kb.claim_task(conn, t["id"])
+    r = client.delete(f"/api/plugins/kanban/tasks/{t['id']}")
+    assert r.status_code == 409
+    assert "running" in r.json()["detail"].lower()
+    # The card and its run are still there.
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, t["id"]) is not None
+        assert kb.get_task(conn, t["id"]).status == "running"
+        assert kb.latest_run(conn, t["id"]) is not None
 
 # ---------------------------------------------------------------------------
 # Comments + Links
