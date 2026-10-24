@@ -8,10 +8,18 @@ Two properties are policed here:
    worker.  The old total-RAM formula returned 8 on an 8 GiB host, which is
    the shape of the 2026-10-22 OOM cascade.
 
-2. A memory reading that is implausibly small must NOT be classified as
-   ``critical``.  ``critical`` freezes dispatch for EVERY profile, so a
-   sampler bug reporting near-zero available would take the whole fleet down
-   with no way to recover but fixing the sampler.
+2. An ESTIMATED memory reading that is implausibly small must NOT be
+   classified as ``critical``.  ``critical`` freezes dispatch for EVERY
+   profile, so a sampler bug reporting near-zero available would take the
+   whole fleet down with no way to recover but fixing the sampler.  The floor
+   applies only to samples carrying ``mem_available_estimated`` (the Darwin
+   sampler, which computes a reclaimable-page figure because macOS publishes
+   no MemAvailable).
+
+3. An AUTHORITATIVE reading is never floored.  On Linux ``MemAvailable`` comes
+   straight from ``/proc/meminfo``; a genuine reading under 2% of total is a
+   real emergency and must stay ``critical``.  Flooring it would keep spawning
+   workers into an OOM — the opposite of what the guard exists for.
 """
 
 from __future__ import annotations
@@ -86,9 +94,13 @@ def test_derived_cap_unknown_memory_is_none() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_implausible_reading_is_unknown_not_critical() -> None:
-    """A sampler bug reporting near-zero available must not brick dispatch."""
-    sample = {"mem_total_kib": EIGHT_GIB_TOTAL_KIB, "mem_available_kib": 65 * 1024}
+def test_implausible_estimated_reading_is_unknown_not_critical() -> None:
+    """An ESTIMATED sampler bug reporting near-zero available must not brick dispatch."""
+    sample = {
+        "mem_total_kib": EIGHT_GIB_TOTAL_KIB,
+        "mem_available_kib": 65 * 1024,
+        "mem_available_estimated": True,
+    }
     assert _memory_pressure_level(sample) == "unknown"
 
 
@@ -97,9 +109,13 @@ def test_naive_free_only_sample_would_have_frozen_dispatch() -> None:
 
     Without the implausibility floor this classifies as ``critical``, which
     returns ``False`` from the dispatch guard and spawns nothing for any
-    profile.  This test pins that the floor catches it.
+    profile.  This test pins that the floor catches the estimated figure.
     """
-    naive = {"mem_total_kib": EIGHT_GIB_TOTAL_KIB, "mem_available_kib": 65 * 1024}
+    naive = {
+        "mem_total_kib": EIGHT_GIB_TOTAL_KIB,
+        "mem_available_kib": 65 * 1024,
+        "mem_available_estimated": True,
+    }
     assert _memory_pressure_level(naive) != "critical"
 
 
@@ -121,9 +137,65 @@ def test_plausible_pressure_is_still_classified() -> None:
     assert _memory_pressure_level(tight) == "elevated"
 
 
-def test_critical_below_the_floor_is_unknown_not_critical() -> None:
-    """Documented trade-off: below 2% of total the reading is treated as
-    untrustworthy rather than an emergency.  Real OOMs are caught by the
-    lifecycle ledger's own RSS tracking."""
-    sample = {"mem_total_kib": EIGHT_GIB_TOTAL_KIB, "mem_available_kib": 40 * 1024}
+def test_estimated_reading_below_the_floor_is_unknown_not_critical() -> None:
+    """Documented trade-off for ESTIMATED figures: below 2% of total the reading
+    is treated as untrustworthy rather than an emergency, because a false
+    ``critical`` freezes every profile's dispatch."""
+    sample = {
+        "mem_total_kib": EIGHT_GIB_TOTAL_KIB,
+        "mem_available_kib": 40 * 1024,
+        "mem_available_estimated": True,
+    }
     assert _memory_pressure_level(sample) == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Authoritative (Linux /proc/meminfo) readings are never floored
+# ---------------------------------------------------------------------------
+
+
+def test_authoritative_low_reading_stays_critical() -> None:
+    """Linux ``MemAvailable`` at 1% of total is a REAL emergency.
+
+    A generic implausibility floor must not override it: flooring an
+    authoritative reading would keep spawning workers into an OOM.
+    """
+    for fraction in (0.005, 0.01, 0.015, 0.019):
+        sample = {
+            "mem_total_kib": EIGHT_GIB_TOTAL_KIB,
+            "mem_available_kib": int(EIGHT_GIB_TOTAL_KIB * fraction),
+        }
+        assert _memory_pressure_level(sample) == "critical", (
+            f"{fraction:.1%} of total available must classify critical, not unknown"
+        )
+
+
+def test_authoritative_absolute_threshold_stays_critical() -> None:
+    """32 MiB available is under the 64 MiB absolute floor regardless of fraction."""
+    sample = {"mem_total_kib": EIGHT_GIB_TOTAL_KIB, "mem_available_kib": 32 * 1024}
+    assert _memory_pressure_level(sample) == "critical"
+
+
+def test_authoritative_and_estimated_disagree_below_the_floor() -> None:
+    """The same near-zero figure: trusted source => critical, estimate => unknown."""
+    avail = 40 * 1024
+    trusted = {"mem_total_kib": EIGHT_GIB_TOTAL_KIB, "mem_available_kib": avail}
+    estimate = {**trusted, "mem_available_estimated": True}
+    assert _memory_pressure_level(trusted) == "critical"
+    assert _memory_pressure_level(estimate) == "unknown"
+
+
+def test_estimated_reading_above_the_floor_is_still_classified() -> None:
+    """The floor must not blind the guard for an ordinary estimated reading."""
+    healthy = {
+        "mem_total_kib": EIGHT_GIB_TOTAL_KIB,
+        "mem_available_kib": int(EIGHT_GIB_TOTAL_KIB * 0.18),
+        "mem_available_estimated": True,
+    }
+    assert _memory_pressure_level(healthy) == "ok"
+    tight = {
+        "mem_total_kib": EIGHT_GIB_TOTAL_KIB,
+        "mem_available_kib": int(EIGHT_GIB_TOTAL_KIB * 0.03),
+        "mem_available_estimated": True,
+    }
+    assert _memory_pressure_level(tight) == "critical"

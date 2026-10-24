@@ -1921,12 +1921,17 @@ DERIVED_MAX_IN_PROGRESS_FLOOR = 2
 DERIVED_MAX_IN_PROGRESS_CEILING = 8
 
 # A memory-pressure reading below this fraction of total RAM is treated as an
-# implausible reading rather than a real emergency. Rationale: a sampler bug
-# that reports a near-zero available figure would otherwise classify as
-# "critical" and freeze dispatch for EVERY profile, with no way to recover
-# except fixing the sampler. Real memory emergencies still show up as a low
-# absolute figure, and the absolute thresholds (64 MiB / 128 MiB) still apply
-# to the remaining headroom.
+# implausible reading rather than a real emergency -- but ONLY for samples that
+# are ESTIMATED rather than reported by the OS (``mem_available_estimated``,
+# set by the Darwin sampler, which computes a reclaimable-page figure because
+# macOS publishes no MemAvailable). Rationale: an estimate can be wrong by a
+# page-size factor, and a false "critical" freezes dispatch for EVERY profile,
+# with no way to recover except fixing the sampler.
+#
+# An authoritative reading is NEVER floored: Linux ``/proc/meminfo``
+# MemAvailable at 1% of total IS the emergency the critical tier exists for, so
+# flooring it would let the fleet spawn into an OOM. That regression is why the
+# floor is keyed on the provenance flag instead of being applied to every sample.
 MEMORY_GUARD_MIN_AVAILABLE_FRACTION = 0.02
 
 
@@ -2063,8 +2068,19 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
 
     Reuses :func:`gateway.memory_status.classify_pressure` so "critical" matches
     the dashboard banner and lifecycle-ledger OOM heuristics. ``unknown``
-    (non-Linux, read failure) imposes no restriction — never brick dispatch
-    where /proc is unavailable.
+    (read failure, non-Linux without a sampler) imposes no restriction — never
+    brick dispatch where /proc is unavailable.
+
+    ``MEMORY_GUARD_MIN_AVAILABLE_FRACTION`` applies ONLY to ESTIMATED readings —
+    samples carrying ``mem_available_estimated`` (the Darwin sampler computes a
+    reclaimable-page figure because macOS publishes no MemAvailable). An
+    estimate can be wrong by a page-size factor and a false ``critical`` freezes
+    every profile, so an implausibly small estimate degrades to ``unknown``.
+
+    An authoritative reading is never floored. On Linux ``MemAvailable`` comes
+    straight from ``/proc/meminfo``; a genuine reading under 2% of total is a
+    real emergency and must stay ``critical``. Flooring it would keep spawning
+    workers into an OOM — the opposite of what the guard is for.
     """
     if sample is None:
         sample = _system_memory_sample()
@@ -2074,15 +2090,17 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
         from gateway.memory_status import classify_pressure
         available = sample.get("mem_available_kib")
         total = sample.get("mem_total_kib")
-        # Reject an implausible reading instead of freezing the whole fleet on it.
-        if isinstance(available, int) and not isinstance(available, bool) \
-                and isinstance(total, int) and not isinstance(total, bool) and total > 0:
-            if available / total < MEMORY_GUARD_MIN_AVAILABLE_FRACTION:
-                _kb._log.warning(
-                    "kanban dispatch: memory sample looks implausible "
-                    "(%s/%s KiB available); treating pressure as unknown", available, total
-                )
-                return "unknown"
+        if sample.get("mem_available_estimated") is True:
+            # Computed estimate: reject an implausible figure instead of freezing
+            # the whole fleet on it.
+            if isinstance(available, int) and not isinstance(available, bool) \
+                    and isinstance(total, int) and not isinstance(total, bool) and total > 0:
+                if available / total < MEMORY_GUARD_MIN_AVAILABLE_FRACTION:
+                    _kb._log.warning(
+                        "kanban dispatch: estimated memory sample looks implausible "
+                        "(%s/%s KiB available); treating pressure as unknown", available, total
+                    )
+                    return "unknown"
         return classify_pressure(available, total)
     except Exception:
         return "unknown"

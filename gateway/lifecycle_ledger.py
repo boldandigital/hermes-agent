@@ -117,6 +117,38 @@ def parse_sysctl_memsize(value: str) -> int:
         return 0
 
 
+# Darwin page sizes in the wild: 4096 (Intel), 16384 (Apple Silicon). A value
+# outside this power-of-two band is treated as a bad read, never trusted.
+_MIN_PAGE_SIZE = 4096
+_MAX_PAGE_SIZE = 65536
+
+
+def _sysctl_pagesize() -> int:
+    """Authoritative Darwin page size in bytes from ``sysctl -n hw.pagesize``; 0 when unknown.
+
+    ``vm_stat``'s header is the only other source, and a missing or reworded
+    header silently falls back to 4096 — 4x too small on Apple Silicon's
+    16 KiB pages, which under-reports available memory enough to read as
+    ``critical``. Ask the OS rather than infer from text. A non-power-of-two or
+    out-of-band value is rejected (returns 0) so a bad read cannot inflate the
+    available figure either.
+    """
+    try:
+        out = subprocess.run(
+            ["/usr/sbin/sysctl", "-n", "hw.pagesize"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        size = int((out.stdout or "").strip())
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return 0
+    if size < _MIN_PAGE_SIZE or size > _MAX_PAGE_SIZE or size & (size - 1):
+        return 0
+    return size
+
+
 def sample_memory() -> dict[str, Any]:
     """System memory snapshot (KiB): own RSS + MemTotal/MemAvailable + swap used.
 
@@ -137,18 +169,45 @@ def sample_memory() -> dict[str, Any]:
 
 
 def _darwin_memory_sample() -> dict[str, Any]:
-    """macOS memory sample (KiB). Uses vm_stat + sysctl; ``{}`` on failure.
+    """macOS memory sample (KiB). Uses vm_stat + sysctl; ``{}`` when unreadable.
 
     The reclaimable set (free + speculative + purgeable + inactive) is reported
     as ``mem_available_kib`` — see :func:`darwin_available_kib` for why the
     naive free-pages-only reading would classify this host as ``critical``.
+
+    The page size comes from ``sysctl -n hw.pagesize``, NOT from vm_stat's
+    header. When the header is missing or reworded, ``parse_vm_stat`` falls
+    back to 4096 while Apple Silicon uses 16384: a 4x under-report that lands
+    near 4% available, reads as ``critical``, and freezes dispatch for every
+    profile. The header value is used only when sysctl is unavailable. When
+    neither source yields a page size — or vm_stat yields no counters at all —
+    the sample is reported as unknown (``{}``) rather than guessed: an
+    unavailable figure imposes no restriction, a wrong one freezes the fleet.
+
+    ``mem_available_estimated`` marks the figure as computed from page counters
+    rather than reported by the OS. :func:`hermes_cli.kanban_db_dispatch.
+    _memory_pressure_level` floors only estimated readings, so an authoritative
+    Linux ``MemAvailable`` is never overridden.
     """
     sample: dict[str, Any] = {}
     try:
         vm_stat = subprocess.run(
             ["/usr/bin/vm_stat"], capture_output=True, text=True, timeout=5, check=False
         )
-        page_size, counts = parse_vm_stat(vm_stat.stdout or "")
+        text = vm_stat.stdout or ""
+        header_page_size, counts = parse_vm_stat(text)
+        page_size = _sysctl_pagesize()
+        if page_size <= 0:
+            if "page size of" not in text:
+                logger.warning(
+                    "Darwin memory sample unavailable: no authoritative page size "
+                    "(sysctl hw.pagesize failed and vm_stat carried no page-size header)"
+                )
+                return {}
+            page_size = header_page_size
+        if not counts:
+            logger.warning("Darwin memory sample unavailable: vm_stat reported no page counters")
+            return {}
         memsize = subprocess.run(
             ["/usr/sbin/sysctl", "-n", "hw.memsize"],
             capture_output=True,
@@ -160,6 +219,7 @@ def _darwin_memory_sample() -> dict[str, Any]:
         if total_kib:
             sample["mem_total_kib"] = total_kib
         sample["mem_available_kib"] = darwin_available_kib(counts, page_size=page_size)
+        sample["mem_available_estimated"] = True
     except Exception:
         logger.debug("Failed to sample Darwin memory", exc_info=True)
         return {}
