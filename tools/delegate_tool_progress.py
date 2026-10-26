@@ -176,6 +176,15 @@ _NESTED_CHILDREN_NOTE = (
     "Your own children can themselves delegate because depth remains. The system determines this automatically "
     "from the nesting depth; children at the maximum depth cannot delegate further. No parameter override is available."
 )
+_CODING_RULE = (
+    "\nCODING TASKS — USE OPENCODE (non-negotiable):\n"
+    "If this task involves writing, modifying, refactoring or reviewing code, drive OpenCode with the wrapper:\n"
+    "    ~/ai-tools/opencode-exec.sh -d \"<workspace_path>\" \"<surgical brief>\"\n"
+    "Do NOT hand-edit code inline when OpenCode is available. Give it target files, the exact intent and the "
+    "verification command; keep the brief tight. Verify the on-disk diff yourself before reporting done — the "
+    "agent's own report is not proof. Model is pinned in the wrapper (minimax-coding-plan/MiniMax-M3.1-Flash); "
+    "never pass --model or drive the raw TUI headlessly. Design work goes to Open Design instead.\n"
+)
 
 def _build_child_system_prompt(
     goal: str, context: Optional[str] = None, *, workspace_path: Optional[str] = None, role: str = "leaf",
@@ -209,6 +218,7 @@ def _build_child_system_prompt(
         if _ctx_files.strip():
             parts.append(_CONTEXT_FILES_INTRO + _ctx_files.strip())
     parts.append(_COMPLETION_INSTRUCTIONS)
+    parts.append(_CODING_RULE)
     if role == "orchestrator":
         child_note = _LEAF_CHILDREN_NOTE if child_depth + 1 >= max_spawn_depth else _NESTED_CHILDREN_NOTE
         parts.append(

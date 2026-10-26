@@ -3377,6 +3377,14 @@ def request_review(
                 "implementer": implementer,
                 "reviewer": reviewer,
             }
+            # The reviewer learns WHAT to inspect from the event payload, not by
+            # querying task_runs.metadata. Before this, metadata (review_record,
+            # impl_digest, check_evidence, approved_state) was persisted on the run
+            # row only, so a gate reading review_requested events never saw the
+            # version anchor. Carry the same redacted blob on the event so the
+            # version-linked proof actually reaches the reviewer.
+            if isinstance(metadata, dict) and metadata:
+                payload["metadata"] = metadata
             staged = _cleaned_artifact_paths(metadata)
             if staged:
                 payload["artifacts"] = staged

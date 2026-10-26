@@ -39,10 +39,15 @@ def _snapshot_primary_runtime(agent):
         "compressor_threshold_tokens": _cc.threshold_tokens,
     }
     if agent.api_mode == "anthropic_messages":
+        # getattr: _init_anthropic_client has early-return paths (e.g. the bedrock
+        # branch) that never assign _anthropic_api_key / _is_anthropic_oauth. Reading
+        # them unconditionally crashed agent construction with
+        #   AttributeError: 'AIAgent' object has no attribute '_anthropic_api_key'
+        # which killed every kanban worker before it could make a single model call.
         agent._primary_runtime.update({
-            "anthropic_api_key": agent._anthropic_api_key,
-            "anthropic_base_url": agent._anthropic_base_url,
-            "is_anthropic_oauth": agent._is_anthropic_oauth,
+            "anthropic_api_key": getattr(agent, "_anthropic_api_key", ""),
+            "anthropic_base_url": getattr(agent, "_anthropic_base_url", agent.base_url),
+            "is_anthropic_oauth": getattr(agent, "_is_anthropic_oauth", False),
         })
 
 
