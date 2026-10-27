@@ -42,6 +42,42 @@ or clobber the working tree.
 
 ## Active patches
 
+### `main` — remove the unused Anthropic model-provider plugin
+
+**What upstream ships.** `plugins/model-providers/anthropic/` is a bundled
+provider profile: `AnthropicProfile` registers itself through
+`providers.register_provider()` and implements the `x-api-key` +
+`anthropic-version` model listing, the `claude` / `claude-oauth` /
+`claude-code` aliases, `api_mode="anthropic_messages"` and
+`default_aux_model="claude-haiku-4-5-20251001"`. It is the only registrant
+of that profile — `providers/` ships no built-in Anthropic profile, so the
+plugin *is* the implementation, not a wrapper around one.
+
+**Why that is wrong here.** This fork runs MiniMax (OAuth coding plan) and
+nothing else: `session_model_usage` holds zero Anthropic sessions and no
+`ANTHROPIC_API_KEY` / `ANTHROPIC_TOKEN` is provisioned. The plugin was
+disabled in `~/.hermes/config.yaml` (`plugins.enabled`) and never loaded a
+session. `hermes_cli/auth.py` keeps its own `anthropic` row in
+`PROVIDER_REGISTRY`, so credential discovery, `hermes setup` and the model
+picker are unaffected — only the runtime profile goes away.
+
+**What the patch changes.** Deletes `plugins/model-providers/anthropic/`
+(`__init__.py`, `plugin.yaml`). Nothing references the path: model
+providers are discovered by directory scan (`hermes_cli/auth.py:260` and
+`hermes_cli/auth_plugin_providers.py:3` mirror `plugins/model-providers/*`
+into `PROVIDER_REGISTRY` at call time), and a grep of the tree finds no
+literal `model-providers/anthropic` reference. Upstream has not touched
+the directory since the merge-base `e04614af7b`, so later upstream merges
+stay conflict-free for this deletion.
+
+**Durable mechanism.** The deletion is a real commit on this branch, so it
+survives `hermes update` under `updates.parked_branch_strategy:
+update_in_place` for as long as the checked-out branch is ahead of
+`origin/main` — the updater parks and merges in place instead of checking
+out `origin/main`. Pushing this commit to the private fork's `main` makes
+it durable unconditionally, because the fork's `main` then *is* the
+patched tree.
+
 ### `fix/mcp-schema-cache-ttl-zero` — TTL=0 turns `mcp_servers.<name>.lazy` inert
 
 **Symptom.** With `lazy: true` set on any MCP server, `_register_lazy_from_cache`
