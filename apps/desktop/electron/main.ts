@@ -217,7 +217,7 @@ import { adoptServedDashboardToken } from './dashboard-token'
 import { resolveDesktopHermesHome, resolveDesktopUserData } from './data-paths'
 import { registerDeepLinkProtocol as registerDeepLinkProtocolWith } from './deep-link-protocol'
 import { loadOrCreateInstallationId, sshOwnershipId } from './desktop-installation'
-import { formatDesktopLogLine, formatLogStamp } from './desktop-log-line'
+import { formatDesktopLogLine, formatLogStamp, isMallocStackLoggingNoise } from './desktop-log-line'
 import {
   createDesktopProfilePreferences,
   DESKTOP_PROFILE_NAME_RE,
@@ -2173,7 +2173,18 @@ function rememberLog(chunk) {
   // One timestamp per chunk: lines arriving in the same event happened
   // at the same moment.  Local time, same shape as agent.log/gui.log.
   const stamp = formatLogStamp(new Date())
-  const lines = text.split(/\r?\n/).map(line => formatDesktopLogLine(line, stamp))
+
+  const lines = text
+    .split(/\r?\n/)
+    // macOS malloc-debug noise from the backend's short-lived python3
+    // children says nothing about the desktop app; keep it out of the log.
+    .filter(line => !isMallocStackLoggingNoise(line))
+    .map(line => formatDesktopLogLine(line, stamp))
+
+  if (lines.length === 0) {
+    return
+  }
+
   hermesLog.push(...lines)
 
   if (hermesLog.length > 300) {

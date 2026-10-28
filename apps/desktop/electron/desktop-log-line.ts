@@ -27,3 +27,20 @@ export function formatLogStamp(date: Date): string {
 export function formatDesktopLogLine(text: string, stamp = formatLogStamp(new Date())): string {
   return `${stamp} [hermes] ${text}`
 }
+
+/**
+ * macOS' MallocStackLogging.framework writes this to a child's stderr when the
+ * system hands it a VM-pressure notification: it tries to turn malloc stack
+ * logging off in a process that never turned it on. The desktop backend spawns
+ * short-lived python3 children (slash workers, compute hosts) that inherit its
+ * stderr, so every one of them can inject the line. It reports nothing about
+ * the desktop app, and the framework has no "turn on" counterpart, so the match
+ * stays on this one sentence.
+ */
+const MALLOC_STACK_LOGGING_NOISE =
+  /^\S+\(\d+\)\s+MallocStackLogging:\s+can't turn off malloc stack logging because it was not enabled\.\s*$/
+
+/** True for the one macOS malloc-debug line that is pure noise in a log file. */
+export function isMallocStackLoggingNoise(line: string): boolean {
+  return MALLOC_STACK_LOGGING_NOISE.test(line)
+}
