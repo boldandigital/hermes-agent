@@ -106,6 +106,56 @@ def test_wrapper_timestamps_child_stdout_into_its_own_stdout(tmp_path):
     assert re.fullmatch(f"{timestamp} stderr line", error_log.read_text(encoding="utf-8").strip())
 
 
+def test_main_drops_malloc_stack_logging_noise(tmp_path):
+    """macOS prints this from a forked child when a memory-pressure event asks the
+    MallocStackLogging framework to switch off stack logging it never switched on. It is
+    OS noise, not a Hermes diagnostic, and it floods the error log."""
+    log_path = tmp_path / "gateway.error.log"
+    noise = (
+        "python3(2777) MallocStackLogging: can't turn off malloc stack logging "
+        "because it was not enabled."
+    )
+    code = (
+        "import sys\n"
+        f"sys.stderr.write({noise!r} + '\\n')\n"
+        "sys.stderr.write('real failure\\n')\n"
+        "sys.exit(3)\n"
+    )
+
+    rc = stderr_timestamp.main(
+        ["--error-log", str(log_path), "--", sys.executable, "-c", code]
+    )
+
+    assert rc == 3
+    lines = log_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} real failure", lines[0])
+
+
+def test_main_keeps_other_malloc_stack_logging_messages(tmp_path):
+    """The filter drops the one known OS sentence only; other MallocStackLogging output
+    stays in the log."""
+    log_path = tmp_path / "gateway.error.log"
+    kept = (
+        "python3(2777) MallocStackLogging: malloc stack logging is not enabled "
+        "for this process."
+    )
+    code = (
+        "import sys\n"
+        f"sys.stderr.write({kept!r} + '\\n')\n"
+        "sys.exit(3)\n"
+    )
+
+    rc = stderr_timestamp.main(
+        ["--error-log", str(log_path), "--", sys.executable, "-c", code]
+    )
+
+    assert rc == 3
+    lines = log_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    assert lines[0].endswith(kept)
+
+
 def test_prepare_upgrades_stale_gateway_argv_under_launchd():
     upgraded = stderr_timestamp._prepare_child_command(
         _STALE_GATEWAY_ARGV, _LAUNCHD_ENV

@@ -21,6 +21,14 @@ _LAUNCHD_LABEL_ENV = "HERMES_LAUNCHD_LABEL"
 _GATEWAY_FATAL_CONFIG_EXIT_CODE = 78
 
 _TIMESTAMP_PREFIX = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3}(?:\s|$)")
+# macOS' own MallocStackLogging.framework writes this to a child's stderr when it handles a
+# VM-pressure notification. It is not a Hermes diagnostic, so it only pollutes the error log.
+# The framework's only message of this family is the "turn off" one (no "turn on" counterpart),
+# so the match stays narrow: any other MallocStackLogging line is still logged.
+_MALLOC_STACK_LOGGING_NOISE = re.compile(
+    r"^\S+\(\d+\)\s+MallocStackLogging:\s+"
+    r"can't turn off malloc stack logging because it was not enabled\.\s*$"
+)
 # A grandchild that inherited stdout can hold the pipe open after the child exits; the
 # wrapper must still exit with the child's status so launchd KeepAlive sees it.
 _STDOUT_DRAIN_TIMEOUT_S = 5.0
@@ -48,10 +56,18 @@ def _open_log(log_path: Path) -> TextIO:
     return log_path.open("a", encoding="utf-8", buffering=1)
 
 
+def _is_ignored_stderr_line(line: str) -> bool:
+    """True for OS-emitted noise that is not a Hermes diagnostic."""
+    return _MALLOC_STACK_LOGGING_NOISE.match(line) is not None
+
+
 def _copy_stderr_with_timestamps(stderr: BinaryIO, log_path: Path) -> None:
     with _open_log(log_path) as log_file:
         for raw_line in iter(stderr.readline, b""):
-            _write_timestamped_line(log_file, raw_line.decode("utf-8", errors="replace"))
+            line = raw_line.decode("utf-8", errors="replace")
+            if _is_ignored_stderr_line(line):
+                continue
+            _write_timestamped_line(log_file, line)
 
 
 def _copy_stdout_with_timestamps(stdout: BinaryIO) -> None:
