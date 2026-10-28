@@ -421,6 +421,39 @@ PARALLEL_TOOL_CALL_GUIDANCE = (
     "read a file before you can patch it). When in doubt and the calls are independent, batch them."
 )
 
+# Universal shipping-discipline guidance (ALL models). This is the COUNTERWEIGHT to the
+# execution-discipline block below and to the "finishing the job" / "prerequisite checks"
+# / "missing context" mandates: those push the model to keep gathering, this pushes it to
+# ship. It exists because the mandate stack produced a real failure mode — a turn that ran
+# six "one more probe round, then I write" rounds and never wrote anything, re-sending the
+# whole transcript every round.
+#
+# Deliberately NOT model-gated (config key agent.ship_discipline): it is the brake FOR the
+# mandate stack, so it must reach every model that receives the mandate. Placed ABOVE the
+# execution-discipline block so the last thing the model reads before acting is "ship", not
+# "keep probing". Keep it tight — it ships in every cached system prompt.
+SHIP_DISCIPLINE_GUIDANCE = (
+    "# Shipping discipline\n"
+    "<ship_the_ask>\n"
+    "- The deliverable is the ask, not everything discovery turns up. Ship the ask first; report "
+    "extra findings in one line and never fix them unless asked.\n"
+    "- ONE read batch, then act. Batch every independent read/search into a single round. Never "
+    "announce a final read round and then read again — if you said 'one more batch', that batch "
+    "was the last one.\n"
+    "- Make the edit before you read more. Reading after the edit is verification, and "
+    "verification is ONE pass — then hand over.\n"
+    "- Do not load skills, roles, or orchestration plans the ask does not need. Tool calls spent "
+    "before the first action cost more than they save.\n"
+    "- If the task needs more than ~15 minutes, or a fleet to be reasonable, stop and report the "
+    "scope for approval instead of continuing.\n"
+    "- If you are blocked, say what is missing in one sentence. Do not buy time with another "
+    "probe round.\n"
+    "- Never fabricate output. If a tool, install, or network call fails and blocks the path, "
+    "say so and try one alternative; made-up tool output, invented file contents, or "
+    "synthesised results are worse than an honest blocker.\n"
+    "</ship_the_ask>"
+)
+
 # Execution-discipline guidance for models that abandon partial results, skip prerequisite lookups, answer
 # from memory, or declare "done" unverified. Body is family-agnostic (OPENAI_ prefix reflects origin).
 # Injection gate: system_prompt.py via config.yaml ``agent.execution_guidance`` (auto/true/false/list).

@@ -83,6 +83,24 @@ DEFAULT_CONFIG = {
         # elapsed; implicit provider stale timeouts capped to remaining budget. CLI equivalent:
         # `hermes chat --run-budget N`.
         "run_budget_seconds": None,
+        # Probe budget: bounds the "one more probe round" failure mode — a turn that keeps
+        # gathering information (reads/searches/execute_code probes) without producing a
+        # deliverable. Every round re-sends the whole transcript, so the cost compounds while
+        # the work product stays at zero. After `notice_after_rounds` such rounds a notice is
+        # appended to the newest tool result; at `halt_after_rounds` the turn is halted and handed
+        # back to the user. enabled=false turns the whole guard off; halt_after_rounds=0 keeps the
+        # notice but never halts.
+        "probe_budget": {
+            "enabled": True,
+            "notice_after_rounds": 4,
+            "halt_after_rounds": 15,
+        },
+        # Shipping-discipline prompt block (ALL models): the counterweight to the
+        # execution-discipline guidance below — one read batch then act, one verification pass
+        # then hand over, ship the literal ask. Deliberately NOT model-gated: it is the brake
+        # for the mandate stack, so it must reach every model that receives the mandate.
+        # false disables.
+        "ship_discipline": True,
         # Gateway inactivity timeout (seconds). Only fires when the agent is completely idle — not
         # while calling tools or receiving API responses. 0 = unlimited.
         "gateway_timeout": 1800,

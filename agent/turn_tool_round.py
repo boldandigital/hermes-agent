@@ -14,6 +14,14 @@ from typing import Any, Dict, Optional, Tuple
 
 from agent.message_metadata import append_message
 from agent.message_sanitization import coalesce_tool_call_id, normalize_provider_tool_call_ids
+from agent.probe_budget import (
+    PROBE_BUDGET_HALT_RESPONSE as _PROBE_HALT_RESPONSE_TEMPLATE,
+    PROBE_BUDGET_NOTICE,
+    PROBE_BUDGET_NOTICE_ESCALATED,
+    announces_final_batch,
+    append_probe_notice,
+    round_produced_deliverable,
+)
 from agent.turn_preflight import compress_after_tool_results
 from agent.turn_tool_validation import validate_tool_calls
 
@@ -24,6 +32,51 @@ _HOUSEKEEPING_TOOLS = frozenset({"memory", "todo_list", "skill_manage", "session
 # Rounds whose visible line is the turn's reply if the follow-up is empty (no empty-response nudge):
 # housekeeping, and setup_beat, whose card already blocked for the user's answer.
 _LINE_IS_REPLY_TOOLS = _HOUSEKEEPING_TOOLS | {"setup_beat"}
+
+
+def _apply_probe_budget(
+    agent: Any, *, messages: Any, round_tool_names: Any, preamble: str,
+) -> int:
+    """Track probe rounds and enforce the probe budget for this turn.
+
+    A *probe round* is a tool round that produced nothing the user can see. The
+    guard exists because every round re-sends the whole transcript: a turn that
+    gathers for ten rounds pays ten times for the same context and still has no
+    deliverable.
+
+    Returns the round count when the turn must be halted, otherwise 0.
+    """
+    if not getattr(agent, "_probe_budget_enabled", False):
+        return 0
+    if round_produced_deliverable(round_tool_names or ()):
+        # Something landed — the budget is refilled for the next phase of the work.
+        agent._probe_rounds_without_deliverable = 0
+        agent._probe_notice_level = 0
+        return 0
+
+    rounds = int(getattr(agent, "_probe_rounds_without_deliverable", 0) or 0) + 1
+    agent._probe_rounds_without_deliverable = rounds
+    notice_after = int(getattr(agent, "_probe_notice_after", 0) or 0)
+    halt_after = int(getattr(agent, "_probe_halt_after", 0) or 0)
+    level = int(getattr(agent, "_probe_notice_level", 0) or 0)
+
+    # "Three last facts, then I write" — the model promised to stop gathering and
+    # then kept going. The promise is the tell, so escalate on it, not only on the count.
+    promised_then_read = announces_final_batch(preamble) and rounds >= 2
+    if level < 1 and (rounds >= notice_after or promised_then_read):
+        if append_probe_notice(messages, PROBE_BUDGET_NOTICE.format(rounds=rounds)):
+            agent._probe_notice_level = 1
+    elif level < 2 and notice_after and rounds >= max(notice_after * 2, notice_after + 1):
+        if append_probe_notice(messages, PROBE_BUDGET_NOTICE_ESCALATED.format(rounds=rounds)):
+            agent._probe_notice_level = 2
+
+    if halt_after and rounds >= halt_after:
+        logger.warning(
+            "Probe budget exhausted: %d rounds without a deliverable — halting the turn.",
+            rounds,
+        )
+        return rounds
+    return 0
 
 
 @dataclass
@@ -163,6 +216,10 @@ def run_tool_round(
         with suppress(Exception):
             agent.stream_delta_callback(None)
 
+    # Snapshot the round's tool names BEFORE execution (the executor may rewrite the
+    # batch) — the probe budget needs to know what this round actually called.
+    _round_tool_names = {tc.function.name for tc in (assistant_message.tool_calls or ())}
+
     agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
     from hermes_cli.observability.shared_metrics_harness import finish_tool_round
 
@@ -174,6 +231,29 @@ def run_tool_round(
         _turn_exit_reason = "session_persistence_failed"
         final_response = ""
         failed = True
+        return _verdict("break")
+
+    # Probe budget: a turn that keeps gathering information without producing
+    # anything re-sends the whole transcript every round. Notice first, controlled
+    # halt when the notices are ignored.
+    _probe_halt = _apply_probe_budget(
+        agent,
+        messages=messages,
+        round_tool_names=_round_tool_names,
+        preamble=assistant_message.content or "",
+    )
+    if _probe_halt:
+        _turn_exit_reason = "probe_budget_halt"
+        final_response = _PROBE_HALT_RESPONSE_TEMPLATE.format(rounds=_probe_halt)
+        agent._emit_diagnostic_status(
+            f"⚠️ Probe budget exhausted: {_probe_halt} rounds without a deliverable"
+        )
+        append_message(messages, {"role": "assistant", "content": final_response})
+        if final_response:
+            agent._safe_print(f"\n{final_response}\n")
+            if agent.stream_delta_callback:
+                agent.stream_delta_callback(final_response)
+                agent.stream_delta_callback(None)
         return _verdict("break")
 
     if agent._tool_guardrail_halt_decision is not None:

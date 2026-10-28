@@ -534,6 +534,12 @@ _CONTROL_STATE: dict[str, Any] = {
     "_trim_after_tool_batch": False,  # a >=1 MB tool result was committed; trim once the batch unwinds
     "_tool_guardrails": ToolCallGuardrailController,
     "_tool_guardrail_halt_decision": None,
+    # Probe budget: rounds without a deliverable, and how many notices already fired.
+    "_probe_budget_enabled": True,
+    "_probe_notice_after": 4,
+    "_probe_halt_after": 15,
+    "_probe_rounds_without_deliverable": 0,
+    "_probe_notice_level": 0,
     # Interrupts. Hard cancellation is separate from redirect/message state; the Event makes
     # the cause atomic for auxiliary stream pollers.
     "_interrupt_requested": False,
@@ -1396,12 +1402,24 @@ def _apply_agent_section(agent, _agent_cfg):
     # of each other (gates in agent/system_prompt.py).
     agent._tool_use_enforcement = _agent_section.get("tool_use_enforcement", "auto")
     agent._execution_guidance = _agent_section.get("execution_guidance", "auto")
+    # Shipping discipline: the counterweight prompt block. Not model-gated — it exists to
+    # brake the mandate stack, so it must reach every model that gets the mandate.
+    agent._ship_discipline = _agent_section.get("ship_discipline", True)
 
     # Wall-clock run budget from config — only when the constructor arg was not given.
     if agent.run_budget_seconds is None:
         agent.run_budget_seconds = _normalize_run_budget_seconds(
             _agent_section.get("run_budget_seconds")
         )
+
+    # Probe budget: bound the "one more probe round" failure mode (gathering without a
+    # deliverable). Disabled by config -> the guard never fires.
+    from agent.probe_budget import resolve_probe_budget
+    (
+        agent._probe_budget_enabled,
+        agent._probe_notice_after,
+        agent._probe_halt_after,
+    ) = resolve_probe_budget(_agent_section.get("probe_budget"))
 
     # Empty-response guard: a malformed section falls back to schema defaults (on, $0.25).
     from agent.empty_response_guard import resolve_guard_settings

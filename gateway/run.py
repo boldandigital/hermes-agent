@@ -4133,7 +4133,11 @@ class GatewayRunner(
         ("compression", "proactive_prune_min_reclaim_tokens"),
         ("compression", "min_tail_user_messages"), ("agent", "disabled_toolsets"),
         ("memory", "provider"), ("checkpoints", "enabled"), ("checkpoints", "max_snapshots"),
-        ("checkpoints", "max_total_size_mb"), ("checkpoints", "max_file_size_mb"))
+        ("checkpoints", "max_total_size_mb"), ("checkpoints", "max_file_size_mb"),
+        # agent.probe_budget is read once at agent init and baked into the agent
+        # (_probe_halt_after). Without it here, a cached agent keeps the OLD
+        # thresholds and a live config edit to the probe budget never takes effect.
+        ("agent", "probe_budget"))
 
     @staticmethod
     def _init_cached_agent_for_turn(agent: Any, interrupt_depth: int) -> None:

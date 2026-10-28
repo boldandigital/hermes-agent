@@ -37,6 +37,7 @@ in an Authorization header.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import sys
@@ -44,6 +45,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -51,11 +53,15 @@ DEFAULT_BANK = "hermes"
 DEFAULT_API_URL = "http://localhost:8888"
 CONFIG_PATH = Path.home() / ".hermes" / "hindsight" / "config.json"
 
-# The Hermes plugin's own retain tag. Writes made by Hermes carry it; the
-# profile-isolation check in the sweep phase asserts that tag is present on
-# Hermes-authored memories and that other profiles are not leaking in.
+# Mirrors the live Hermes Hindsight config (~/.hermes/hindsight/config.json):
+#   retain_tags   = "profile:root"
+#   recall_types  = ["observation", "world"]
+#   recall_budget = "mid",  recall_max_tokens = 2048
 HERMES_RETAIN_TAGS = ["profile:root"]
 HERMES_RETAIN_SOURCE = "hermes-agent"
+HERMES_RECALL_TYPES = ["observation", "world"]
+HERMES_RECALL_BUDGET = "mid"
+HERMES_RECALL_MAX_TOKENS = 2048
 
 
 # --------------------------------------------------------------------------- #
@@ -182,6 +188,27 @@ def make_client(api_url: str, api_key: str | None):
         print(f"  ! hindsight_client SDK unavailable: {type(exc).__name__}")
         return None
     return Hindsight(base_url=api_url, api_key=api_key or None)
+
+
+def close_client(client: Any) -> None:
+    """Close the SDK's aiohttp session so it does not leak on exit."""
+    if client is None:
+        return
+    closer = getattr(client, "close", None) or getattr(client, "aclose", None)
+    if closer is None:
+        return
+    try:
+        result = closer()
+        if asyncio.iscoroutine(result):
+            try:
+                asyncio.get_event_loop().run_until_complete(result)
+            except RuntimeError:
+                # No running loop in this thread; close the raw session instead.
+                session = getattr(client, "_session", None) or getattr(client, "session", None)
+                if session is not None:
+                    session.close()
+    except Exception:
+        pass
 
 
 # --------------------------------------------------------------------------- #
@@ -364,33 +391,81 @@ def _check_no_stuck_operations(api: Api, bank: str, rep: Report, label: str) -> 
                 active=len(ops))
 
 
-def phase_retain(api: Api, bank: str, rep: Report, marker: str) -> str | None:
-    """Validation write through the real retain route. Returns the marker."""
+def phase_retain(api: Api, bank: str, rep: Report, marker: str, client: Any) -> str | None:
+    """Validation write through the real retain route. Returns the marker.
+
+    Prefers the SDK's ``retain_batch`` -- the exact call the Hermes plugin
+    makes -- so a pass proves the production write path, not just the REST
+    endpoint. Falls back to the equivalent HTTP body if the SDK is absent.
+    """
     print("\n== phase 4: retain (validation write) ==", flush=True)
     content = (
         f"Health-check validation record {marker}. "
         "This memory was written by the Hindsight production health test to prove that "
         "retain, consolidation and the original Hermes recall path are all functioning."
     )
+    metadata = {"source": HERMES_RETAIN_SOURCE, "health_check": marker}
+
+    if client is not None:
+        # Exactly the item shape the Hermes plugin builds (_build_retain_kwargs).
+        item = {
+            "content": content,
+            "metadata": metadata,
+            "timestamp": datetime.now(UTC).isoformat(),
+            "context": "hindsight health test validation write",
+            "tags": list(HERMES_RETAIN_TAGS),
+            "observation_scopes": "per_tag",
+        }
+        try:
+            resp = client.retain_batch(
+                bank_id=bank,
+                items=[item],
+                retain_async=True,
+            )
+            ok = bool(getattr(resp, "success", False)) or getattr(resp, "operation_id", None) is not None
+            rep.add(
+                "retain/validation_write_accepted",
+                ok,
+                f"sdk retain_batch success={getattr(resp, 'success', None)} "
+                f"operation_id={getattr(resp, 'operation_id', None)}",
+                operation_id=getattr(resp, "operation_id", None),
+                items_count=getattr(resp, "items_count", None),
+            )
+            return marker
+        except Exception as exc:
+            rep.add("retain/sdk_retain_batch", False, f"{type(exc).__name__}: {str(exc)[:200]}")
+
+    # Fallback: the same body over HTTP (POST /memories -> RetainRequest).
     body = {
         "items": [
             {
                 "content": content,
                 "context": "hindsight health test validation write",
-                "metadata": {"source": HERMES_RETAIN_SOURCE, "health_check": marker},
-                "tags": HERMES_RETAIN_TAGS,
-                "observation_scopes": ["healthcheck"],
+                "metadata": metadata,
+                "tags": list(HERMES_RETAIN_TAGS),
+                "observation_scopes": "per_tag",
             }
         ],
         "async": True,
         "document_tags": ["healthcheck", marker],
     }
     try:
-        res = api.post(f"/v1/default/banks/{bank}/files/retain", body=body, timeout=120)
-        ok = isinstance(res, dict) and (res.get("status") in ("accepted", "completed", "success") or "request_id" in res)
-        rep.add("retain/validation_write_accepted", ok,
-                f"status={res.get('status') if isinstance(res,dict) else res} request_id={(res.get('request_id') if isinstance(res,dict) else None)}",
-                response=res if isinstance(res, dict) else {"raw": str(res)[:200]})
+        res = api.post(f"/v1/default/banks/{bank}/memories", body=body, timeout=120)
+        # The server answers {"success": true, "bank_id", "items_count", "async",
+        # "operation_id", "operation_ids", "usage"} -- there is no "status".
+        ok = isinstance(res, dict) and (
+            res.get("success") is True
+            or res.get("status") in ("accepted", "completed", "success")
+            or bool(res.get("operation_id") or res.get("request_id"))
+        )
+        rep.add(
+            "retain/validation_write_accepted",
+            ok,
+            f"success={res.get('success') if isinstance(res, dict) else None} "
+            f"items_count={res.get('items_count') if isinstance(res, dict) else None} "
+            f"operation_id={res.get('operation_id') if isinstance(res, dict) else None}",
+            response=res if isinstance(res, dict) else {"raw": str(res)[:200]},
+        )
         return marker
     except Exception as exc:
         rep.add("retain/validation_write_accepted", False, str(exc)[:300])
@@ -440,9 +515,9 @@ def phase_consolidate(api: Api, bank: str, rep: Report, marker: str, client: Any
         resp = client.recall(
             bank_id=bank,
             query=f"health check validation record {marker}",
-            types=["observation", "world"],
-            budget="mid",
-            max_tokens=4096,
+            types=list(HERMES_RECALL_TYPES),
+            budget=HERMES_RECALL_BUDGET,
+            max_tokens=HERMES_RECALL_MAX_TOKENS,
         )
         results = getattr(resp, "results", None) or []
         texts = [getattr(r, "text", "") or "" for r in results]
@@ -552,65 +627,102 @@ def phase_sweep(api: Api, bank: str, rep: Report) -> None:
 
 
 def phase_sql(api: Api, bank: str, rep: Report) -> None:
-    """Direct SQL invariants. Requires a reachable psql + DATABASE_URL."""
+    """Direct SQL invariants.
+
+    Two transports are supported:
+
+    * ``HINDSIGHT_DATABASE_URL`` -- a normal Postgres URL; ``psql`` is used.
+    * ``HINDSIGHT_SQL_COMMAND``  -- a shell command that reads SQL on stdin and
+      writes the result to stdout. This is how the check runs against the
+      production database, which listens only inside the service container's
+      network namespace: the command is ``ssh <host> docker exec -i hindsight
+      psql ...``. Credentials then live in the remote environment, never in a
+      command line on this machine.
+    """
     print("\n== phase 8: sql invariants ==", flush=True)
     import subprocess
 
     dsn = os.environ.get("HINDSIGHT_DATABASE_URL") or os.environ.get("DATABASE_URL")
-    if not dsn:
-        rep.skip("sql/*", "no DATABASE_URL in environment")
+    cmd = os.environ.get("HINDSIGHT_SQL_COMMAND")
+
+    if not dsn and not cmd:
+        rep.skip("sql/*", "no HINDSIGHT_DATABASE_URL or HINDSIGHT_SQL_COMMAND in environment")
         return
 
     def q(sql: str) -> str:
-        out = subprocess.run(
-            ["psql", dsn, "-t", "-A", "-c", sql],
-            capture_output=True,
-            text=True,
-            timeout=120,
-            check=False,
-        )
-        if out.returncode != 0:
-            raise RuntimeError(out.stderr.strip()[:200])
-        return out.stdout.strip()
+        if cmd:
+            proc = subprocess.run(
+                cmd,
+                shell=True,
+                input=sql,
+                capture_output=True,
+                text=True,
+                timeout=180,
+                check=False,
+            )
+        else:
+            proc = subprocess.run(
+                ["psql", dsn, "-t", "-A", "-c", sql],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+            )
+        if proc.returncode != 0:
+            raise RuntimeError(proc.stderr.strip()[:200])
+        return proc.stdout.strip()
 
+    def scalar(sql: str) -> int:
+        out = q(sql)
+        try:
+            return int(out.splitlines()[0].strip())
+        except (IndexError, ValueError) as exc:
+            raise RuntimeError(f"unexpected scalar output: {out[:120]!r}") from exc
+
+    safe_bank = bank.replace("'", "''")
     try:
-        pending = int(q(
-            f"select count(*) from memory_units where bank_id='{bank}' and consolidated_at is null "
+        pending = scalar(
+            "select count(*) from memory_units where bank_id='"
+            + safe_bank
+            + "' and consolidated_at is null "
             "and consolidation_failed_at is null and fact_type in ('experience','world')"
-        ))
+        )
         rep.add("sql/pending_zero", pending == 0, f"pending={pending}", pending=pending)
     except Exception as exc:
         rep.add("sql/pending_zero", False, str(exc)[:200])
     try:
-        active = int(q(
-            f"select count(*) from operations where bank_id='{bank}' and status in ('pending','processing')"
-        ))
+        active = scalar(
+            "select count(*) from operations where bank_id='"
+            + safe_bank
+            + "' and status in ('pending','processing')"
+        )
         rep.add("sql/ops_active", active == 0, f"active={active}", active=active)
     except Exception as exc:
         rep.add("sql/ops_active", False, str(exc)[:200])
     try:
-        orphan_links = int(q(
+        orphan_links = scalar(
             "select count(*) from memory_links l where not exists "
             "(select 1 from memory_units u where u.id=l.from_unit_id) "
             "or not exists (select 1 from memory_units u where u.id=l.to_unit_id)"
-        ))
+        )
         rep.add("sql/no_orphan_links", orphan_links == 0, f"orphans={orphan_links}")
     except Exception as exc:
         rep.add("sql/no_orphan_links", False, str(exc)[:200])
     try:
-        orphan_posts = int(q(
+        orphan_posts = scalar(
             "select count(*) from unit_entities ue where not exists "
             "(select 1 from memory_units u where u.id=ue.unit_id) "
             "or not exists (select 1 from entities e where e.id=ue.entity_id)"
-        ))
+        )
         rep.add("sql/no_orphan_postings", orphan_posts == 0, f"orphans={orphan_posts}")
     except Exception as exc:
         rep.add("sql/no_orphan_postings", False, str(exc)[:200])
     try:
-        nmodels = int(q(f"select count(*) from mental_models where bank_id='{bank}'"))
-        empty = int(q(
-            f"select count(*) from mental_models where bank_id='{bank}' and coalesce(length(content::text),0)=0"
-        ))
+        nmodels = scalar(f"select count(*) from mental_models where bank_id='{safe_bank}'")
+        empty = scalar(
+            f"select count(*) from mental_models where bank_id='{safe_bank}' "
+            "and coalesce(length(content::text),0)=0"
+        )
         rep.add("sql/models_non_empty", empty == 0 and nmodels > 0,
                 f"models={nmodels} empty_content={empty}", models=nmodels, empty=empty)
     except Exception as exc:
@@ -664,7 +776,7 @@ def main(argv: list[str] | None = None) -> int:
     if "drain" in phases:
         phase_drain(api, bank, rep, args.wait_drain_timeout, args.drain_poll)
     if "retain" in phases:
-        phase_retain(api, bank, rep, marker)
+        phase_retain(api, bank, rep, marker, client)
     if "consolidate" in phases:
         phase_consolidate(api, bank, rep, marker, client)
     if "models" in phases:
@@ -685,6 +797,7 @@ def main(argv: list[str] | None = None) -> int:
         "ok": not failed,
         "checks": [c.to_dict() for c in rep.checks],
     }
+    close_client(client)
     print("\n" + "=" * 72)
     print(f"RESULT: {'PASS' if not failed else 'FAIL'}  "
           f"({len(rep.passed)} passed, {len(failed)} failed, {len(rep.checks)} total)")
