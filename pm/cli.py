@@ -424,6 +424,7 @@ def cmd_env(args) -> int:
 
 
 def cmd_doctor(args) -> int:
+    from pm.doctor import check_environment, recorded_fact
     from pm.install import _identity, _installed_location
     from pm.store import tree_digest
 
@@ -471,6 +472,13 @@ def cmd_doctor(args) -> int:
             bad += 1
             continue
         print(f"✓ {name} {fact['version']}")
+    # The tool bytes are only half the install: the dependency environment a
+    # worker spawns from drifts on its own, and that drift used to surface as a
+    # worker crash instead of here.
+    ok, lines = check_environment(recorded_fact())
+    for line in lines:
+        print(line)
+    bad += 0 if ok else 1
     return 1 if bad else 0
 
 
