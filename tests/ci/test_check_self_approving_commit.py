@@ -49,6 +49,26 @@ def _commit(repo: Path, files: dict[str, str], msg: str = "step") -> str:
     return _git(repo, "rev-parse", "HEAD")
 
 
+def _merge(repo: Path, branch: str, resolution: dict[str, str], msg: str = "merge") -> str:
+    """Merge ``branch`` into HEAD and commit; ``resolution`` is the merge's own content.
+
+    ``resolution`` holds the files the merge itself changes: the content the merge writes for
+    them, staged over whatever the merge put in the worktree (conflict markers included). An
+    empty resolution means the merge combines the branches and changes nothing itself.
+    """
+    proc = subprocess.run(["git", "merge", "--no-ff", "--no-commit", branch], cwd=repo, env=_env(),
+                          capture_output=True, text=True, encoding="utf-8", stdin=subprocess.DEVNULL,
+                          timeout=60, check=False)
+    assert proc.returncode in (0, 1), (proc.stdout, proc.stderr)  # 1 = conflicts, resolved below
+    for rel, body in resolution.items():
+        path = repo / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body, encoding="utf-8")
+        _git(repo, "add", "--", rel)
+    _git(repo, "commit", "-q", "-m", msg)
+    return _git(repo, "rev-parse", "HEAD")
+
+
 def _registry(repo: Path, pairs: list[dict[str, object]]) -> Path:
     path = repo / REGISTRY_NAME
     path.write_text(json.dumps({"version": 1, "description": "which test guards which source",
@@ -107,6 +127,56 @@ def test_guard_test_and_source_in_separate_commits_are_not_flagged(repo):
     _commit(repo, {GUARD_TEST: "def test_thing():\n    assert False\n"}, "widen the guard")
     head = _commit(repo, {GUARD_SOURCE: "VALUE = 2\n"}, "change the code")
     proc = _run(repo, "--base", base, "--head", head)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_ordinary_commit_that_changes_both_sides_is_still_flagged(repo):
+    # The merge rule must not change how an ordinary commit is judged.
+    base = _git(repo, "rev-parse", "HEAD")
+    head = _commit(repo, {GUARD_TEST: "def test_thing():\n    assert False\n",
+                           GUARD_SOURCE: "VALUE = 2\n"}, "widen the guard and the code")
+    proc = _run(repo, "--base", base, "--head", head)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert head[:7] in proc.stdout
+
+
+def test_ordinary_commit_that_changes_one_side_is_still_not_flagged(repo):
+    # The merge rule must not change how an ordinary commit is judged.
+    base = _git(repo, "rev-parse", "HEAD")
+    head = _commit(repo, {GUARD_TEST: "def test_thing():\n    assert False\n"}, "widen the guard")
+    proc = _run(repo, "--base", base, "--head", head)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_merge_commit_that_changes_the_guard_test_and_its_source_is_flagged(repo):
+    # A merge is judged on what it changes itself: if its own resolution widens the guard test
+    # and changes the guarded source, the merge approves itself and must be reported.
+    base = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, {GUARD_TEST: "def test_thing():\n    assert False\n"}, "widen the guard")
+    _commit(repo, {GUARD_SOURCE: "VALUE = 2\n"}, "change the code")
+    _git(repo, "checkout", "-q", "main")
+    _commit(repo, {GUARD_TEST: "def test_thing():\n    assert 0\n"}, "widen the guard")
+    _commit(repo, {GUARD_SOURCE: "VALUE = 3\n"}, "change the code")
+    merge = _merge(repo, "feature", {GUARD_TEST: "def test_thing():\n    assert True\n",
+                                      GUARD_SOURCE: "VALUE = 4\n"}, "merge with its own resolution")
+    proc = _run(repo, "--base", base, "--head", merge)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert GUARD_TEST in proc.stdout
+    assert GUARD_SOURCE in proc.stdout
+    assert merge[:7] in proc.stdout
+
+
+def test_merge_commit_that_only_combines_two_separately_good_commits_is_not_flagged(repo):
+    # The merge itself changed neither side: one commit widened the guard, another changed the
+    # source. Combining them is not self-approving, so the merge must not be reported.
+    base = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, {GUARD_TEST: "def test_thing():\n    assert False\n"}, "widen the guard")
+    _git(repo, "checkout", "-q", "main")
+    _commit(repo, {GUARD_SOURCE: "VALUE = 2\n"}, "change the code")
+    merge = _merge(repo, "feature", {}, "merge the branch")
+    proc = _run(repo, "--base", base, "--head", merge)
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
