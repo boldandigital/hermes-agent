@@ -17,6 +17,41 @@ from pathlib import Path
 from hermes_constants import get_default_hermes_root, project_venv_dir
 
 
+def _gitdir_from_git_file(text: str) -> str | None:
+    """The gitdir a ``.git`` FILE names, or ``None`` when it names none."""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("gitdir:"):
+            value = stripped[len("gitdir:"):].strip()
+            return value or None
+    return None
+
+
+def _linked_worktree_owner(root: Path, gitdir: str) -> Path | None:
+    """The checkout owning the linked worktree at *root*, or ``None``.
+
+    Git records a linked worktree's gitdir as ``<owner>/.git/worktrees/<name>``,
+    so the owner is the path in front of ``.git`` -- read as TEXT and never
+    resolved: the owner's gitdir holds live repository state, and install
+    identity runs on boot and launcher hot paths where touching it is out of
+    bounds. A ``--separate-git-dir`` clone names a bare gitdir and a bare repo's
+    worktree names ``<bare>/worktrees/<name>``; neither is an owning checkout,
+    and both keep path-based keying.
+    """
+    candidate = Path(gitdir)
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    normalized = Path(os.path.normpath(str(candidate)))
+    worktrees_dir = normalized.parent
+    if not normalized.name or worktrees_dir.name != "worktrees":
+        return None
+    owner_git = worktrees_dir.parent
+    if owner_git.name != ".git":
+        return None
+    owner = owner_git.parent
+    return owner if owner.name else None
+
+
 def canonical_checkout_root(project_root: Path) -> Path:
     """The checkout whose dependency state *project_root* belongs to.
 
@@ -27,12 +62,12 @@ def canonical_checkout_root(project_root: Path) -> Path:
     inside a worktree died with "no dependency environment is committed for this
     install", and ``hermes pm repair`` only ever repaired the main checkout.
 
-    Detection is pure filesystem inspection -- no ``git`` subprocess, because
-    ``install_key`` runs on boot and launcher hot paths. A primary checkout has
-    ``.git`` as a DIRECTORY; a linked worktree has ``.git`` as a FILE naming a
-    gitdir under ``<owner>/.git/worktrees/``, whose ``commondir`` points at the
-    shared ``<owner>/.git``. A ``--separate-git-dir`` clone has a ``.git`` file
-    too but no ``commondir``: it is not a worktree and keeps its own key.
+    A primary checkout has ``.git`` as a DIRECTORY and keys on its own path; a
+    linked worktree has ``.git`` as a FILE naming
+    ``<owner>/.git/worktrees/<name>`` and keys on that owner. The owner is read
+    as TEXT out of the worktree's own ``.git`` file and normalised lexically:
+    the owner's gitdir is live repository state that install identity may not
+    stat, resolve or read.
 
     Never raises: any unreadable or unexpected layout yields *project_root*
     itself, so a plain directory keeps path-based keying.
@@ -43,47 +78,17 @@ def canonical_checkout_root(project_root: Path) -> Path:
         return Path(project_root)
     dotgit = root / ".git"
     try:
-        if dotgit.is_dir() or not dotgit.is_file():
+        if not dotgit.is_file():
             return root
         text = dotgit.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return root
 
-    gitdir = None
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("gitdir:"):
-            gitdir = stripped[len("gitdir:"):].strip()
-            break
+    gitdir = _gitdir_from_git_file(text)
     if not gitdir:
         return root
-
-    try:
-        gitdir_path = Path(gitdir)
-        if not gitdir_path.is_absolute():
-            gitdir_path = root / gitdir_path
-        gitdir_path = gitdir_path.resolve()
-        if not gitdir_path.is_dir():
-            return root
-        commondir = gitdir_path / "commondir"
-        if not commondir.is_file():
-            return root  # a --separate-git-dir clone: its own gitdir, no shared common dir
-        content = commondir.read_text(encoding="utf-8").strip()
-        if not content:
-            return root
-        common = Path(content)
-        if not common.is_absolute():
-            common = gitdir_path / common
-        common = common.resolve()
-        if common.name != ".git":
-            return root
-        owner = common.parent
-        owner_git = owner / ".git"
-        if not owner_git.is_dir() or owner_git.resolve() != common:
-            return root
-        return owner
-    except (OSError, ValueError):
-        return root
+    owner = _linked_worktree_owner(root, gitdir)
+    return owner if owner is not None else root
 
 
 def install_key(project_root: Path) -> str:
@@ -189,11 +194,11 @@ def activation_input_mtimes(project_root: Path) -> dict[str, int]:
     """Snapshot before installing, so an input edited mid-install records its
     pre-install mtime and the next run re-activates.
 
-    The inputs are the OWNING checkout's: a linked worktree shares the owner's
-    environment, so the owner's inputs are the ones the install was verified
-    against.
+    The inputs are the ones in the checkout the install ran in: that is the
+    dependency set this install verified its environment against. The OWNING
+    checkout's identity is recorded separately, in ``.project-root``.
     """
-    root = canonical_checkout_root(project_root)
+    root = Path(project_root)
     return {name: (root / name).stat().st_mtime_ns for name in ACTIVATION_INPUTS if (root / name).is_file()}
 
 

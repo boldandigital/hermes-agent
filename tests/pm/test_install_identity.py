@@ -14,9 +14,13 @@ running gateway without its environment.
 
 from __future__ import annotations
 
+import builtins
+import contextlib
 import hashlib
+import io
 import json
 import os
+import pathlib
 import shutil
 import subprocess
 import sys
@@ -27,6 +31,7 @@ import pytest
 from hermes_cli.update_channel import channel_record, install_id
 from hermes_cli.update_owning_install import owning_install_root
 from pm.environments import (
+    activation_input_mtimes,
     activation_inputs_dir,
     committed_venv,
     install_key,
@@ -213,3 +218,134 @@ def test_canonical_checkout_root_of_unparsable_git_file_is_itself(tmp_path):
     (broken / ".git").write_text("gitdir: /nonexistent/gitdir\n", encoding="utf-8")
 
     assert pm.environments.canonical_checkout_root(broken) == broken.resolve()
+
+
+def test_worktree_of_a_bare_repo_keeps_its_own_key(git_repo, tmp_path):
+    """A bare repo's worktree names ``<bare>/worktrees/<name>``, not ``<owner>/.git/...``.
+
+    There is no owning checkout to borrow a committed environment from, so it keeps
+    path-based keying.
+    """
+    bare = tmp_path / "bare.git"
+    _git(tmp_path, "clone", "-q", "--bare", str(git_repo), str(bare))
+    worktree = tmp_path / "bare-wt"
+    _git(bare, "worktree", "add", "-q", str(worktree), "-b", "bare/branch")
+
+    assert install_key(worktree) == _key_of(worktree)
+    assert install_key(worktree) != install_key(bare)
+
+
+def test_worktree_of_a_symlinked_owner_shares_the_owners_key(git_repo, tmp_path):
+    """Git records the owner's real path in the worktree's ``.git`` file.
+
+    The identity must follow it: the worktree and the checkout it was added from
+    are the same repository, even when the checkout was reached through a symlink.
+    """
+    real = tmp_path / "real" / "repo"
+    real.mkdir(parents=True)
+    _git(real, "init", "-q")
+    _git(real, "commit", "-q", "--allow-empty", "-m", "init")
+    link = tmp_path / "link"
+    link.symlink_to(real, target_is_directory=True)
+    worktree = tmp_path / "link-wt"
+    _git(link, "worktree", "add", "-q", str(worktree), "-b", "link/branch")
+
+    assert install_key(worktree) == install_key(real)
+
+
+def test_unreadable_git_file_keeps_path_based_keying(tmp_path):
+    broken = tmp_path / "broken"
+    broken.mkdir()
+    dotgit = broken / ".git"
+    dotgit.write_text("gitdir: /nonexistent/gitdir\n", encoding="utf-8")
+    dotgit.chmod(0o000)
+    try:
+        try:
+            dotgit.read_text(encoding="utf-8")
+        except OSError:
+            pass
+        else:
+            pytest.skip("this user can read a mode-000 file")
+
+        assert pm.environments.canonical_checkout_root(broken) == broken.resolve()
+        assert install_key(broken) == _key_of(broken)
+    finally:
+        dotgit.chmod(0o644)
+
+
+@contextlib.contextmanager
+def _recorded_paths(monkeypatch):
+    """Record every path the block touches through the filesystem entry points."""
+    touched: list[tuple[str, str]] = []
+
+    def spy(op, original):
+        def wrapper(*args, **kwargs):
+            target = args[0] if args else kwargs.get("path")
+            if target is None:
+                target = kwargs.get("file")
+            try:
+                touched.append((op, os.path.normpath(os.fspath(target))))
+            except TypeError:
+                touched.append((op, os.path.normpath(str(target))))
+            return original(*args, **kwargs)
+
+        return wrapper
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "stat", spy("stat", os.stat))
+        patch.setattr(os, "lstat", spy("lstat", os.lstat))
+        patch.setattr(os, "readlink", spy("readlink", os.readlink))
+        patch.setattr(os.path, "realpath", spy("realpath", os.path.realpath))
+        patch.setattr(builtins, "open", spy("open", builtins.open))
+        patch.setattr(io, "open", spy("open", io.open))
+        patch.setattr(pathlib.Path, "resolve", spy("resolve", pathlib.Path.resolve))
+        patch.setattr(pathlib.Path, "stat", spy("stat", pathlib.Path.stat))
+        patch.setattr(pathlib.Path, "is_dir", spy("is_dir", pathlib.Path.is_dir))
+        patch.setattr(pathlib.Path, "is_file", spy("is_file", pathlib.Path.is_file))
+        yield touched
+
+
+def test_worktree_identity_never_touches_the_owners_git(git_repo, linked_worktree, monkeypatch):
+    """Identifying a worktree must not read the OWNING checkout's ``.git``.
+
+    ``install_key`` runs on boot and launcher hot paths against the real checkout,
+    where ``<owner>/.git`` holds live repository state outside the checkout the
+    caller handed us. Deriving the owner from the worktree's own ``.git`` file is
+    therefore a purely lexical operation: the owner's gitdir may not be stat'ed,
+    resolved, listed or read.
+    """
+    owner_git = os.path.normpath(str(git_repo / ".git"))
+    worktree_git = os.path.normpath(str(linked_worktree / ".git"))
+    expected_key = install_key(git_repo)
+
+    with _recorded_paths(monkeypatch) as touched:
+        key = install_key(linked_worktree)
+
+    assert key == expected_key
+    # The spy must have seen the worktree's own .git file, else it proves nothing.
+    assert worktree_git in {path for _, path in touched}
+
+    offending = sorted(
+        {path for _, path in touched if path == owner_git or path.startswith(owner_git + os.sep)}
+    )
+    assert not offending, f"the owning checkout's .git was touched: {offending}"
+
+
+def test_activation_input_snapshot_reads_only_the_installing_checkout(git_repo, linked_worktree, monkeypatch):
+    """An install's input snapshot comes from the checkout the install ran in.
+
+    The state dir is shared with the owning checkout, but the inputs an install
+    verified its environment against are the ones in the checkout it ran in --
+    reading another checkout's files is out of bounds on an install path.
+    """
+    (git_repo / "uv.lock").write_text("owner\n", encoding="utf-8")
+    (linked_worktree / "uv.lock").write_text("worktree\n", encoding="utf-8")
+    os.utime(git_repo / "uv.lock", ns=(1_000_000_000, 1_000_000_000))
+    os.utime(linked_worktree / "uv.lock", ns=(2_000_000_000, 2_000_000_000))
+
+    with _recorded_paths(monkeypatch) as touched:
+        mtimes = activation_input_mtimes(linked_worktree)
+
+    assert mtimes == {"uv.lock": 2_000_000_000}
+    owner_uv_lock = os.path.normpath(str(git_repo / "uv.lock"))
+    assert owner_uv_lock not in {path for _, path in touched}
