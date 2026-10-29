@@ -1012,6 +1012,7 @@ All commands are also available as a slash command in the interactive CLI and in
 |------------|---------|--------------|
 | `kanban.max_in_progress` | unset (unlimited) | Caps the number of simultaneously running tasks. When the board already has N running, the dispatcher skips spawning more — useful for slow workers (local LLMs, resource-constrained hosts) so they finish what they have before more pile up and time out. Invalid or below-1 values log a warning and behave as unlimited. |
 | `kanban.max_in_progress_per_profile` | unset (unlimited) | Per-profile variant of `max_in_progress` — caps how many tasks any single assignee profile may run concurrently. Useful when one profile is slow or rate-limited but others should keep flowing. Applies alongside the board-wide `max_in_progress`; both must allow a spawn for it to proceed. |
+| `kanban.lanes` | unset (one shared pool) | Per-risk-lane capacity, e.g. `{high: 1, normal: 1, low: 1}`. A lane at its capacity defers **its own** cards only — the other lanes keep their capacity, so urgent work is not queued behind cosmetic work. `max_in_progress` stays the hard ceiling; lanes only subdivide it. A lane you don't name is uncapped. A malformed value (wrong type, negative, unknown lane name, capacity `0`) is refused wholesale, logged, and the board keeps its shared pool. See [Risk lanes](#risk-lanes). |
 | `kanban.dispatch_profiles` | unset (any existing profile) | Per-home claim allowlist for boards shared across Hermes homes. When the key is present, this home's dispatcher only claims cards whose assignee is listed — fail-closed: an empty list, `null` or a bare `dispatch_profiles:` claims nothing, and a config read that fails logs a warning and claims nothing; other assignees land in `skipped_nonspawnable`. Only omitting the key means "any existing profile". `hermes kanban diagnostics` prints the resolved value for this home (`any`, the listed names, or `none (fail-closed: …)`). See [Shared boards across homes](#shared-boards-across-homes). |
 | `kanban.auto_promote_children` | `true` | After `decompose_triage_task()` produces children with no parent-blocker dependencies, they're automatically promoted to `ready` so the dispatcher can pick them up. Set to `false` to require manual review — children stay in `todo` until you promote them. |
 | `kanban.default_workdir` | unset | Board-level default working directory applied to new tasks when neither `--workspace` nor the task itself overrides it. Per-task `workspace:` still wins. |
@@ -1019,9 +1020,44 @@ All commands are also available as a slash command in the interactive CLI and in
 ```yaml
 kanban:
   max_in_progress: 2
+  lanes:
+    high: 1
+    normal: 1
+    low: 1
   auto_promote_children: false
   default_workdir: ~/work/active-project
 ```
+
+### Risk lanes
+
+Every card carries a risk class, and the class decides which lane the card waits in. A card's class comes from the `RISK:` line in its body — the same line `hermes kanban specify` and the decomposer write:
+
+```
+Goal
+RISK: high
+```
+
+`high`, `normal` and `low` are the three classes; a card without a `RISK:` line is `normal`. The class is stored **on the card**, so the dispatcher never re-reads the body to decide.
+
+`kanban.lanes` reserves capacity per class:
+
+```yaml
+kanban:
+  max_in_progress: 2        # hard ceiling — lanes never exceed it
+  lanes:
+    high: 1
+    normal: 1
+    low: 1
+```
+
+With that plan the board runs at most one high-risk card at a time even while a low-risk card occupies the other slot — the low lane is full, so the *next* low card waits, but the high card still starts. Without `kanban.lanes` the board keeps one shared pool: every card competes for the same slots and only `max_in_progress` and priority order decide who runs.
+
+Notes:
+
+- Lanes only ever **subdivide** the ceiling. `max_in_progress` is still the hard cap; a lane capacity of 5 with a ceiling of 2 still runs two workers.
+- A lane you leave out of the mapping is uncapped (it falls back to the shared pool) — it never reads as "capacity 0", which would wedge the board.
+- A malformed mapping (wrong type, a negative capacity, an unknown lane name, a capacity of `0`) is refused **as a whole**, reported in the log, and the board keeps its shared pool. One typo can never half-apply a lane plan.
+- Cards deferred by a full lane are picked up on the next tick. `hermes kanban dispatch` lists them (`Deferred (<lane> lane at capacity N): <task id>`), `--json` reports them as `skipped_lane_capped`, and the gateway's "dispatcher stuck" summary counts them as `lane_capped`.
 
 ### Scheduled task starts (`scheduled_at`)
 
