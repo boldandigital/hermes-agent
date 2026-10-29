@@ -114,6 +114,43 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
+# A card body states its own risk class in one ``RISK:`` line; the class — not
+# the clock — decides what the dispatcher schedules first.
+RISK_PRIORITY = {"high": 90, "normal": 50, "low": 10}
+DEFAULT_TASK_PRIORITY = RISK_PRIORITY["normal"]
+_RISK_LINE_RE = re.compile(r"^\s*risk\s*:\s*(?P<value>.*?)\s*$", re.IGNORECASE)
+
+
+def priority_from_risk_line(body: Optional[str]) -> Optional[int]:
+    """The priority a card body asks for in its ``RISK:`` line, or ``None``.
+
+    The first ``RISK:`` line in the body decides; surrounding whitespace and
+    case are forgiven. A value outside the taxonomy is ignored rather than
+    guessed, so an unknown risk class never crashes card creation.
+    """
+    if not body:
+        return None
+    for line in body.splitlines():
+        match = _RISK_LINE_RE.match(line)
+        if match is None:
+            continue
+        return RISK_PRIORITY.get(match.group("value").strip().lower())
+    return None
+
+
+def resolve_task_priority(body: Optional[str], priority: int = 0) -> int:
+    """The priority a card is created with.
+
+    Precedence, decided once for every creation path: the body's own ``RISK:``
+    line wins; without one, an explicit caller priority is kept (so
+    ``--priority N`` and the dashboard still work); without one and without an
+    explicit priority, the card is normal.
+    """
+    risk_priority = priority_from_risk_line(body)
+    if risk_priority is not None:
+        return risk_priority
+    return priority or DEFAULT_TASK_PRIORITY
+
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     """``VALID_REASONING_EFFORTS`` or ``"none"`` (thinking off), case-insensitive;
@@ -1220,6 +1257,9 @@ def create_task(
     )
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
+    # The body's own RISK line outranks the caller's priority; without one the
+    # caller's explicit priority stands, and the card is normal.
+    priority = resolve_task_priority(body, priority)
 
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
     # race may insert twice, the next lookup stabilises on the newest.

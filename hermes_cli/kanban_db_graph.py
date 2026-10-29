@@ -181,7 +181,7 @@ def _insert_decomposed_child(
     ``<repo>/.worktrees/<child-id>`` per child from the board anchor.
     """
     from hermes_cli.kanban_db import (
-        _new_task_id, _canonical_assignee, _append_event,
+        _new_task_id, _canonical_assignee, _append_event, resolve_task_priority,
     )
 
     root_ws_kind = root_row["workspace_kind"] or "scratch"
@@ -196,15 +196,19 @@ def _insert_decomposed_child(
         child_ws_path = None
     new_id = _new_task_id()
     body = child.get("body")
+    body = body if isinstance(body, str) else None
+    # This path bypasses ``create_task``, so the RISK line is resolved here too
+    # — a card that only ranks by risk on the specify path is a half-dead rule.
+    priority = resolve_task_priority(body)
     conn.execute(
         "INSERT INTO tasks "
-        "(id, title, body, assignee, status, workspace_kind, "
+        "(id, title, body, assignee, status, priority, workspace_kind, "
         " workspace_path, tenant, created_at, created_by) "
-        "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+        "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?)",
         (
-            new_id, child["title"].strip(), body if isinstance(body, str) else None,
-            _canonical_assignee(child.get("assignee")), child_ws_kind, child_ws_path,
-            root_row["tenant"], now, (author or "decomposer"),
+            new_id, child["title"].strip(), body,
+            _canonical_assignee(child.get("assignee")), priority, child_ws_kind,
+            child_ws_path, root_row["tenant"], now, (author or "decomposer"),
         ),
     )
     _append_event(
