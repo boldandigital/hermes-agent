@@ -355,6 +355,19 @@ jobs:
     with:
       commit: ${{ inputs.commit }}
 
+  # The guard judges the commits a reviewer sees: a PR that splits a guard test
+  # from the source it guards is fine, a PR that puts both in one commit is not.
+  # PR-only on purpose: a squash-merge folds a correctly split PR back into ONE
+  # commit that touches both sides, so judging main's post-merge history would
+  # be a false positive.
+  self-approving-check:
+    name: Reject self-approving commits
+    needs: detect
+    if: needs.detect.outputs.event_name == 'pull_request'
+    uses: ./.github/workflows/self-approving-check.yml
+    with:
+      commit: ${{ inputs.commit }}
+
   lazy-deps-guard:
     name: No production imports of the tools.lazy_deps stub
     needs: detect
@@ -407,9 +420,9 @@ jobs:
   #   by detect.outputs must succeed; only unselected consumers may skip.
   #   Release (inputs.release): strict — every required job must be
   #   `success`. A skipped required lane fails the gate; only the PR-only
-  #   jobs (history-check, lockfile-diff, prompt-surface-diff, supply-chain) and
-  #   the deferred Desktop E2E (e2e-desktop) may skip. The OSV scan's
-  #   findings are advisory, but its execution is required.
+  #   jobs (history-check, lockfile-diff, prompt-surface-diff, supply-chain,
+  #   self-approving-check) and the deferred Desktop E2E (e2e-desktop) may skip.
+  #   The OSV scan's findings are advisory, but its execution is required.
   #
   # Branch protection should require ONLY this check.
   #
@@ -446,6 +459,7 @@ jobs:
       - infographic-check
       - case-collision-check
       - blob-size-check
+      - self-approving-check
       - lazy-deps-guard
       - lockfile-diff
       - prompt-surface-diff
