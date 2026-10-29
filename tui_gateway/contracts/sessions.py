@@ -5,6 +5,8 @@ listing/browsing stored rows, spawn-tree snapshots, event replay and the statele
 
 from __future__ import annotations
 
+from typing import Any
+
 from pydantic import Field
 
 from .base import JsonValue, Params, Result, WireEnum
@@ -137,6 +139,13 @@ class SessionCreateParams(ProfileParams):
     # #65410: stable caller-chosen key so a retried create (response lost in
     # transit) returns the SAME session instead of a duplicate child.
     idempotency_key: str | None = None
+    # runtime.describe advertises these (CREATE_FIELDS), and the canonical create
+    # contract accepts them, so the terminal TUI sends them on EVERY create.
+    # Forbidding them here made the legacy dispatcher refuse each create with
+    # 4001 invalid_params (extra_forbidden) and the TUI die with
+    # "Error: invalid_params" (exit 2), while the desktop kept working.
+    request_id: str | None = None
+    client_env: dict[str, Any] | None = None
 
 
 class SessionCreateResult(Result):
