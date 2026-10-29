@@ -15,6 +15,7 @@ from pathlib import Path
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_db_lanes as _kbl
 from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli.kanban_output import _err, _fmt_ts, _print_json
 
@@ -59,8 +60,8 @@ def _cmd_tail(args: argparse.Namespace) -> int:
 
 def _cmd_dispatch(args: argparse.Namespace) -> int:
     # Honour kanban.default_assignee, kanban.max_in_progress,
-    # kanban.max_in_progress_per_profile and kanban.max_spawn with the same
-    # semantics as the gateway dispatch path.
+    # kanban.max_in_progress_per_profile, kanban.max_spawn and kanban.lanes with
+    # the same semantics as the gateway dispatch path.
     try:
         from hermes_cli.config import load_config
         _cfg = load_config()
@@ -78,9 +79,15 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         max_spawn = (
             cli_max if cli_max is not None else kbd._positive_int(_kanban_cfg.get("max_spawn"), None)
         )
+        # Risk-lane capacity. A malformed mapping is reported and ignored — the
+        # board keeps its single shared pool rather than wedging on a typo.
+        lane_capacities, lane_error = _kbl.parse_lane_capacities(_kanban_cfg.get("lanes"))
+        if lane_error:
+            _err(f"kanban.lanes: {lane_error} — ignoring the lane configuration")
     except Exception:
         default_assignee = max_in_progress_per_profile = max_in_progress = None
         max_spawn = getattr(args, "max", None)
+        lane_capacities = None
     with kbc.connect_closing() as conn:
         res = kbd.dispatch_once(
             conn,
@@ -90,6 +97,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             failure_limit=getattr(args, "failure_limit", kbd.DEFAULT_FAILURE_LIMIT),
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            lane_capacities=lane_capacities,
         )
     if getattr(args, "json", False):
         _print_json({
@@ -104,6 +112,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "skipped_per_profile_capped": [
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
+            ],
+            "skipped_lane_capped": [
+                {"task_id": tid, "lane": lane, "capacity": capacity}
+                for (tid, lane, capacity) in res.skipped_lane_capped
             ],
             "auto_assigned_default": res.auto_assigned_default,
             "respawn_guarded": [
@@ -141,6 +153,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         print(f"Skipped (unassigned): {', '.join(res.skipped_unassigned)}")
     for tid, who, current in res.skipped_per_profile_capped:
         print(f"Deferred ({who} at per-profile cap, {current} running): {tid}")
+    for tid, lane, capacity in res.skipped_lane_capped:
+        print(f"Deferred ({lane} lane at capacity {capacity}): {tid}")
     if res.skipped_nonspawnable:
         print(
             f"Skipped (non-spawnable assignee — terminal lane, OK): "

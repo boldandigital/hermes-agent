@@ -42,6 +42,7 @@ class _DispatcherSettings:
     reconcile_orphans: bool
     default_assignee: Optional[str]
     max_in_progress_per_profile: Optional[int]
+    lane_capacities: Optional[dict[str, int]] = None
 
 
 def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettings:
@@ -102,6 +103,18 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
         logger.info("kanban dispatcher: default_assignee=%r (unassigned ready tasks "
                     "will route to this profile)", default_assignee)
 
+    # Risk-lane capacity: a lane at its capacity defers its OWN cards only, so
+    # urgent work is not queued behind cosmetic work. Unset = one shared pool.
+    # A malformed mapping is reported and ignored — it must never wedge the
+    # dispatcher or half-apply a lane plan.
+    from hermes_cli import kanban_db_lanes as _kbl
+    lane_capacities, lane_error = _kbl.parse_lane_capacities(kanban_cfg.get("lanes"))
+    if lane_error:
+        logger.warning("kanban dispatcher: ignoring kanban.lanes — %s", lane_error)
+        lane_capacities = None
+    elif lane_capacities:
+        logger.info("kanban dispatcher: kanban.lanes=%s", lane_capacities)
+
     return _DispatcherSettings(
         interval=interval,
         max_spawn=max_spawn,
@@ -115,6 +128,8 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
         # Per-profile concurrency cap: no single profile's local model / API
         # quota / browser pool gets overwhelmed by a fan-out.
         max_in_progress_per_profile=_positive_int_setting(kanban_cfg, "max_in_progress_per_profile"),
+        # Risk-lane capacity (``kanban.lanes``).
+        lane_capacities=lane_capacities,
     )
 
 

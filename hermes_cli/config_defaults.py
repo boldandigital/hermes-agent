@@ -1915,6 +1915,17 @@ DEFAULT_CONFIG = {
         # fan-out workflows that would otherwise saturate one profile's local model / API quota / browser
         # pool while leaving other profiles idle. See #21582.
         "max_in_progress_per_profile": None,
+        # Risk-lane capacity: maps a risk class to how many cards of that class
+        # may run at the same time, e.g. {"high": 1, "normal": 1, "low": 1}.
+        # A lane at its capacity defers its OWN cards only — the other lanes keep
+        # their capacity, so urgent work is never queued behind cosmetic work.
+        # "max_in_progress" stays the hard ceiling; lanes only subdivide it.
+        # Unset (None) means "one shared pool" — the historic behaviour, no
+        # behaviour change until an operator opts in. A lane that is not named
+        # is uncapped (it must not read as "capacity 0" and wedge the board).
+        # A malformed mapping (wrong type, negative, unknown lane name, capacity
+        # 0) is refused wholesale, reported, and the board keeps its shared pool.
+        "lanes": None,
         # Per-home claim allowlist for boards shared across Hermes homes (#110995): profile names
         # this home's dispatcher may claim (list or comma-separated string). None = any existing
         # profile is claimable. Set = fail-closed (an empty list claims nothing). Every home has a

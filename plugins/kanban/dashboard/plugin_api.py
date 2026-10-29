@@ -1271,7 +1271,10 @@ def get_task_log(task_id: str, tail: Optional[int] = Query(None, ge=1, le=2_000_
 def dispatch(dry_run: bool = Query(False), max_n: int = Query(8, alias="max"), board: Optional[str] = Query(None)):
     """Dispatch nudge so the UI doesn't wait out the 60 s dispatcher tick."""
     with _board_conn(board) as (board, conn):
-        result = kbd.dispatch_once(conn, dry_run=dry_run, max_spawn=max_n, board=board)
+        result = kbd.dispatch_once(
+            conn, dry_run=dry_run, max_spawn=max_n, board=board,
+            lane_capacities=kbd.configured_lane_capacities(),
+        )
         try:
             return asdict(result)  # DispatchResult is a dataclass
         except TypeError:

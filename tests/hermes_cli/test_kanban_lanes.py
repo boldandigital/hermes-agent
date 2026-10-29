@@ -323,3 +323,123 @@ def test_a_card_deferred_by_its_lane_runs_on_a_later_tick(
         lane_capacities={"high": 1, "normal": 1, "low": 1},
     )
     assert _spawned_ids(second) == [low2]
+
+
+# ── the operator-facing configuration ───────────────────────────────────────
+
+@pytest.fixture
+def cli_home(tmp_path, monkeypatch):
+    """A fresh HERMES_HOME for the CLI / daemon entry points."""
+    home = tmp_path / ".hermes"
+    (home / "profiles" / "default").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    return home
+
+
+def test_the_lane_configuration_is_unset_by_default():
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+    assert "lanes" in DEFAULT_CONFIG["kanban"]
+    assert DEFAULT_CONFIG["kanban"]["lanes"] is None
+
+
+def test_the_dispatcher_reads_the_lane_capacities_from_the_config(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"kanban": {"lanes": {"high": 1, "normal": 1, "low": 1}}},
+    )
+    assert kbd.configured_lane_capacities() == {"high": 1, "normal": 1, "low": 1}
+
+
+def test_a_malformed_lane_configuration_falls_back_to_one_shared_pool(monkeypatch, caplog):
+    """A typo must not wedge the board — and it must not pass unnoticed."""
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"kanban": {"lanes": {"high": 0}}},
+    )
+    with caplog.at_level("WARNING"):
+        assert kbd.configured_lane_capacities() is None
+    assert any("kanban.lanes" in r.getMessage() for r in caplog.records)
+
+
+def test_the_daemon_passes_the_configured_lane_capacities(cli_home, monkeypatch):
+    import threading
+
+    captured: dict = {}
+    stop = threading.Event()
+
+    def fake_dispatch_once(conn, **kwargs):
+        captured.update(kwargs)
+        return kb.DispatchResult()
+
+    monkeypatch.setattr(kbd, "dispatch_once", fake_dispatch_once)
+    monkeypatch.setattr(kbd, "configured_lane_capacities", lambda: {"high": 1})
+
+    kbd.run_daemon(interval=0.01, stop_event=stop, on_tick=lambda res: stop.set())
+
+    assert captured.get("lane_capacities") == {"high": 1}
+
+
+def test_the_cli_passes_the_configured_lane_capacities_to_the_dispatcher(cli_home, monkeypatch):
+    import argparse
+
+    from hermes_cli import kanban_ops
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {"lanes": {"high": 2, "normal": 1, "low": 1}}},
+    )
+    captured: dict = {}
+    monkeypatch.setattr(
+        kbd, "dispatch_once",
+        lambda conn, **kw: (captured.update(kw), kb.DispatchResult())[1],
+    )
+
+    args = argparse.Namespace(dry_run=True, max=None, failure_limit=2, json=False)
+    kanban_ops._cmd_dispatch(args)
+
+    assert captured.get("lane_capacities") == {"high": 2, "normal": 1, "low": 1}
+
+
+def test_the_cli_refuses_a_malformed_lane_configuration(cli_home, monkeypatch, capsys):
+    import argparse
+
+    from hermes_cli import kanban_ops
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {"lanes": {"urgent": 1}}},
+    )
+    captured: dict = {}
+    monkeypatch.setattr(
+        kbd, "dispatch_once",
+        lambda conn, **kw: (captured.update(kw), kb.DispatchResult())[1],
+    )
+
+    args = argparse.Namespace(dry_run=True, max=None, failure_limit=2, json=False)
+    kanban_ops._cmd_dispatch(args)
+
+    assert captured.get("lane_capacities") is None
+    assert "kanban.lanes" in capsys.readouterr().err
+
+
+def test_the_gateway_resolves_the_lane_capacities():
+    from gateway import kanban_watchers_dispatcher as gw
+
+    settings = gw._resolve_dispatcher_settings({"lanes": {"high": 1, "low": 1}}, kb)
+    assert settings.lane_capacities == {"high": 1, "low": 1}
+
+
+def test_the_gateway_refuses_a_malformed_lane_configuration(caplog):
+    from gateway import kanban_watchers_dispatcher as gw
+
+    with caplog.at_level("WARNING"):
+        settings = gw._resolve_dispatcher_settings({"lanes": {"high": -1}}, kb)
+    assert settings.lane_capacities is None
+    assert any("kanban.lanes" in r.getMessage() for r in caplog.records)
+
+
+def test_the_suppression_summary_names_a_full_lane():
+    """The gateway's "why is nothing spawning" line must name a full lane."""
+    result = kbd.DispatchResult(skipped_lane_capped=[("t_1", "high", 1)])
+    assert "lane_capped=1" in kbd.describe_suppression([result])

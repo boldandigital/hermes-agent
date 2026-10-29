@@ -174,6 +174,8 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
             counts[reason] = counts.get(reason, 0) + 1
         if res.rate_limited:
             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
+        if res.skipped_lane_capped:
+            counts["lane_capped"] = counts.get("lane_capped", 0) + len(res.skipped_lane_capped)
         if res.skipped_locked:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
         if res.memory_pressure:
@@ -1908,6 +1910,25 @@ def configured_max_in_progress() -> Optional[int]:
     return ival if ival >= 1 else None
 
 
+def configured_lane_capacities() -> Optional[dict[str, int]]:
+    """Read ``kanban.lanes`` from config; ``None`` when unset or malformed.
+
+    Shared so every dispatch entry point agrees on the lane plan. A malformed
+    value is reported and ignored — the board falls back to its single shared
+    pool instead of wedging or half-applying a lane plan.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        raw = (load_config_readonly() or {}).get("kanban", {}).get("lanes")
+    except Exception:
+        return None
+    capacities, error = _kbl.parse_lane_capacities(raw)
+    if error:
+        _kb._log.warning("kanban dispatch: ignoring kanban.lanes — %s", error)
+        return None
+    return capacities
+
+
 def count_running_tasks(conn: sqlite3.Connection) -> int:
     """Number of tasks in ``status='running'``.
 
@@ -2979,12 +3000,14 @@ def run_daemon(
             # Re-resolved every tick (config load is mtime-cached) so operator
             # edits apply without a restart.
             max_in_progress = resolve_max_in_progress(configured_max_in_progress())
+            lane_capacities = configured_lane_capacities()
             with contextlib.closing(_kbc.connect()) as conn:
                 res = dispatch_once(
                     conn,
                     max_spawn=max_spawn,
                     max_in_progress=max_in_progress,
                     failure_limit=failure_limit,
+                    lane_capacities=lane_capacities,
                 )
             if on_tick is not None:
                 with contextlib.suppress(Exception):
