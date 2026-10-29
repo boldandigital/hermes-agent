@@ -17,8 +17,77 @@ from pathlib import Path
 from hermes_constants import get_default_hermes_root, project_venv_dir
 
 
+def canonical_checkout_root(project_root: Path) -> Path:
+    """The checkout whose dependency state *project_root* belongs to.
+
+    A linked git worktree shares its repository's committed dependency
+    environment, so its install identity must be the OWNING checkout's. Keying
+    on the worktree's own path gave every worktree a private
+    ``installs/<key>`` state dir, which holds no environment: a worker booted
+    inside a worktree died with "no dependency environment is committed for this
+    install", and ``hermes pm repair`` only ever repaired the main checkout.
+
+    Detection is pure filesystem inspection -- no ``git`` subprocess, because
+    ``install_key`` runs on boot and launcher hot paths. A primary checkout has
+    ``.git`` as a DIRECTORY; a linked worktree has ``.git`` as a FILE naming a
+    gitdir under ``<owner>/.git/worktrees/``, whose ``commondir`` points at the
+    shared ``<owner>/.git``. A ``--separate-git-dir`` clone has a ``.git`` file
+    too but no ``commondir``: it is not a worktree and keeps its own key.
+
+    Never raises: any unreadable or unexpected layout yields *project_root*
+    itself, so a plain directory keeps path-based keying.
+    """
+    try:
+        root = Path(project_root).resolve()
+    except (OSError, ValueError):
+        return Path(project_root)
+    dotgit = root / ".git"
+    try:
+        if dotgit.is_dir() or not dotgit.is_file():
+            return root
+        text = dotgit.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return root
+
+    gitdir = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("gitdir:"):
+            gitdir = stripped[len("gitdir:"):].strip()
+            break
+    if not gitdir:
+        return root
+
+    try:
+        gitdir_path = Path(gitdir)
+        if not gitdir_path.is_absolute():
+            gitdir_path = root / gitdir_path
+        gitdir_path = gitdir_path.resolve()
+        if not gitdir_path.is_dir():
+            return root
+        commondir = gitdir_path / "commondir"
+        if not commondir.is_file():
+            return root  # a --separate-git-dir clone: its own gitdir, no shared common dir
+        content = commondir.read_text(encoding="utf-8").strip()
+        if not content:
+            return root
+        common = Path(content)
+        if not common.is_absolute():
+            common = gitdir_path / common
+        common = common.resolve()
+        if common.name != ".git":
+            return root
+        owner = common.parent
+        owner_git = owner / ".git"
+        if not owner_git.is_dir() or owner_git.resolve() != common:
+            return root
+        return owner
+    except (OSError, ValueError):
+        return root
+
+
 def install_key(project_root: Path) -> str:
-    canonical = str(Path(project_root).resolve())
+    canonical = str(canonical_checkout_root(project_root))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
 
@@ -118,8 +187,13 @@ def activation_inputs_dir(project_root: Path) -> Path:
 
 def activation_input_mtimes(project_root: Path) -> dict[str, int]:
     """Snapshot before installing, so an input edited mid-install records its
-    pre-install mtime and the next run re-activates."""
-    root = Path(project_root)
+    pre-install mtime and the next run re-activates.
+
+    The inputs are the OWNING checkout's: a linked worktree shares the owner's
+    environment, so the owner's inputs are the ones the install was verified
+    against.
+    """
+    root = canonical_checkout_root(project_root)
     return {name: (root / name).stat().st_mtime_ns for name in ACTIVATION_INPUTS if (root / name).is_file()}
 
 
@@ -130,6 +204,9 @@ def record_activation_inputs(stamps: Path, mtimes: dict[str, int], project_root:
     rewrites an input without changing it moves the mtime, and only this record
     brings the stamp back to equal. The runner compares for equality, not order,
     because switching branches can move an input's mtime in either direction.
+
+    The recorded root is the OWNING checkout, so a linked worktree and its
+    checkout name the same install.
     """
     import shutil
 
@@ -137,7 +214,13 @@ def record_activation_inputs(stamps: Path, mtimes: dict[str, int], project_root:
     # The sentinel is inherited by child shells; equal input mtimes in another
     # checkout must never make their test interpreter appear current here.
     stamps.mkdir(parents=True, exist_ok=True)
-    (stamps / ".project-root").write_text(str(Path(project_root).resolve()), encoding="utf-8")
+    # The OWNING checkout, not the directory the install ran from: the state dir
+    # is shared with every worktree of that checkout, so the record must name the
+    # owner. The GC reads it to tell a deleted checkout from a live one (a
+    # worktree path would let a deleted worktree reclaim the owner's live
+    # state), and the updater reads it to find the install that owns this
+    # interpreter.
+    (stamps / ".project-root").write_text(str(canonical_checkout_root(project_root)), encoding="utf-8")
     if test_environment:
         (stamps / ".test-environment").touch()
     for name, mtime in mtimes.items():
