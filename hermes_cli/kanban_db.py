@@ -3451,10 +3451,11 @@ def _nonblank_str(value: Any) -> Optional[str]:
 
 def request_changes(
     conn: sqlite3.Connection, task_id: str, *, reason: str, expected_run_id: Optional[int] = None,
+    verdict: Optional[str] = None,
 ) -> tuple[bool, Optional[str]]:
     """Close an active reviewer run (claimed from ``review``) and hand the task
     back to the implementer from the latest ``review_requested`` event, parent
-    gating reapplied. Returns ``(ok, implementer | reason)``."""
+    gating reapplied; the verdict rides along as a FENCE record."""
     reason = str(redact_review_value(reason or "")).strip()
     if not reason:
         return False, "reason is required"
@@ -3504,18 +3505,14 @@ def request_changes(
         run_id = _end_run(
             conn, task_id, outcome="changes_requested", status=new_status, summary=reason,
         )
-        _append_event(
-            conn,
-            task_id,
-            "changes_requested",
-            {
-                "reason": reason,
-                "implementer": implementer,
-                "reviewer": reviewer,
-                "status": new_status,
-            },
-            run_id=run_id,
+        fence = record_fence(
+            conn, task_id, reviewer=reviewer, reason=reason, verdict=verdict,
         )
+        payload = {
+            "reason": reason, "implementer": implementer,
+            "reviewer": reviewer, "status": new_status, "verdict": fence,
+        }
+        _append_event(conn, task_id, "changes_requested", payload, run_id=run_id)
     return True, implementer
 
 
@@ -3844,21 +3841,22 @@ def schedule_task(
 
 def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     """Everything a worker should read about its task: header, body,
-    attachments, prior attempts, done-parent handoffs, the assignee's recent
-    work, comments. Lists are tail-capped and fields char-capped
-    (``_CTX_MAX_*``) so the prompt stays bounded on pathological boards."""
+    attachments, the previous verdict, prior attempts, done-parent handoffs,
+    the assignee's recent work, comments. Lists are tail-capped and fields
+    char-capped (``_CTX_MAX_*``) so the prompt stays bounded on a bad board."""
     task = get_task(conn, task_id)
     if not task:
         raise ValueError(f"unknown task {task_id}")
     from hermes_cli.kanban_db_context import (
-        _ctx_attachments, _ctx_comments, _ctx_header, _ctx_parent_results, _ctx_prior_attempts,
-        _ctx_role_history,
+        _ctx_attachments, _ctx_comments, _ctx_header, _ctx_parent_results, _ctx_previous_verdict,
+        _ctx_prior_attempts, _ctx_role_history,
     )
     # One clock reading so every relative age in this rendering agrees.
     now = int(time.time())
     lines: list[str] = []
     _ctx_header(lines, task)
     _ctx_attachments(lines, list_attachments(conn, task_id))
+    _ctx_previous_verdict(lines, conn, task_id)
     _ctx_prior_attempts(lines, conn, task_id, now)
     _ctx_parent_results(lines, conn, task_id, now)
     _ctx_role_history(lines, conn, task, now)
@@ -4178,3 +4176,4 @@ from hermes_cli.kanban_db_dispatch import (
     _worker_survived_termination,
     _worker_terminal_timeout_env,
 )
+from hermes_cli.kanban_db_fence import record_fence

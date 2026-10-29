@@ -15,6 +15,7 @@ import time
 from typing import TYPE_CHECKING, Any, Optional
 
 import hermes_cli.kanban_db as _kb
+from hermes_cli.kanban_db_fence import latest_verdict
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Attachment, Comment, Task
@@ -124,6 +125,23 @@ def _ctx_attachments(lines: list[str], attachments: list[Attachment]) -> None:
         size_str = f", {size_kb} KB" if size_kb else ""
         ctype = f", {att.content_type}" if att.content_type else ""
         lines.append(f"- `{att.filename}`{ctype}{size_str} → `{att.stored_path}`")
+    lines.append("")
+
+
+def _ctx_previous_verdict(lines: list[str], conn: sqlite3.Connection, task_id: str) -> None:
+    """The last FENCE verdict on this card — what the reviewer expected and
+    what they actually saw. The next attempt starts from it.
+
+    Rendered only when a verdict exists: a card that was never reviewed must
+    not teach the worker that nothing was expected of it.
+    """
+    verdict = latest_verdict(conn, task_id)
+    if not verdict:
+        return
+    lines.append("## Previous verdict (FENCE)")
+    lines.append(f"EXPECTED: {verdict['expected']}")
+    lines.append(f"SEEN: {verdict['seen']}")
+    lines.append(f"VERDICT: {verdict['verdict']}")
     lines.append("")
 
 
