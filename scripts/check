@@ -100,7 +100,8 @@ exit $status
 
 # name -> argv (relative to the repo root); mirrors the blocking steps in lint.yml, plus the
 # unconditional guards CI runs in their own workflows (case-collision-check.yml,
-# lazy-deps-guard.yml, profile-artifact-check.yml, blob-size-check.yml).
+# lazy-deps-guard.yml, profile-artifact-check.yml, blob-size-check.yml) and the
+# PR-only self-approving-check.yml.
 _GUARDS = {
     "footguns": ["scripts/check-windows-footguns.py", "--all"],
     "shebangs": ["scripts/check_bash_shebangs.py"],

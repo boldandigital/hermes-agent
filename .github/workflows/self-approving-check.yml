@@ -1,0 +1,52 @@
+name: Self-Approving Commit Check
+# Rejects a commit that changes a guard test and the source that test guards in
+# one go: the widened test can no longer fail the change the commit allows, so
+# the change ships unreviewed by the very check meant to catch it. The remedy is
+# to split the commit -- the guard test first, the source change second.
+#
+# scripts/check runs the same guard locally and in the git hooks, but only a CI
+# job can block a merge, so the guard lives here and ci.yaml calls it.
+#
+# The guard judges every commit in base..head on its own, so a PR that splits
+# the guard test and its source into two commits passes -- that is the shape the
+# guard asks for. A squash-merge folds such a PR back into one commit, which is
+# why ci.yaml only calls this on pull requests.
+on:
+  workflow_call:
+    inputs:
+      commit:
+        description: Commit to test and build. Empty keeps the triggering commit.
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  check-self-approving:
+    name: Reject self-approving commits
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 5
+    steps:
+      - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
+        with:
+          ref: ${{ inputs.commit }}
+
+      # The PR's OWN commits, not the synthetic refs/pull/N/merge commit: that one
+      # merges both sides of a split commit back together and its diff-tree is
+      # empty, so it would judge nothing. The checkout above is depth-1, so
+      # deepen both sides until a merge-base exists.
+      - name: Fetch the pull request's own commits
+        # Bound the fetch so a deep deepen loop cannot eat the job's budget.
+        timeout-minutes: 3
+        env:
+          PR_HEAD: "+refs/pull/${{ github.event.pull_request.number }}/head:refs/remotes/origin/pr-head"
+        run: |
+          git fetch --no-tags --deepen=200 origin "${{ github.base_ref }}" "$PR_HEAD"
+          for i in 1 2 3; do
+            git merge-base "origin/${{ github.base_ref }}" origin/pr-head >/dev/null 2>&1 && break
+            git fetch --no-tags --deepen=1000 origin "${{ github.base_ref }}" "$PR_HEAD"
+          done
+
+      - name: Reject a commit that changes a guard test and the code it guards
+        run: python3 scripts/ci/check_self_approving_commit.py --base "origin/${{ github.base_ref }}" --head origin/pr-head
