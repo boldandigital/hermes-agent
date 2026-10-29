@@ -146,6 +146,28 @@ class SessionCreateParams(ProfileParams):
     # "Error: invalid_params" (exit 2), while the desktop kept working.
     request_id: str | None = None
     client_env: dict[str, Any] | None = None
+    # The rest of the advertised create surface (CREATE_FIELDS). runtime.describe
+    # advertises these and the canonical contract accepts them, so the terminal TUI
+    # sends whichever apply to the launch. The legacy contract must declare them
+    # all: an undeclared one is refused as extra_forbidden -> 4000 invalid_params
+    # -> the TUI dies with "Error: invalid_params" (exit 2).
+    toolsets: list[str] | None = None
+    skills: list[str] | None = None
+    max_turns: int | str | None = None
+    reasoning: str | None = None
+    api_key: str | None = None
+    base_url: str | None = None
+    row_cwd: str | None = None
+    editor: dict[str, JsonValue] | None = None
+    run_budget: float | None = None
+    yolo: bool | None = None
+    safe_mode: bool | None = None
+    ignore_user_config: bool | None = None
+    ignore_rules: bool | None = None
+    checkpoints: bool | None = None
+    accept_hooks: bool | None = None
+    pass_session_id: bool | None = None
+    verbose: bool | None = None
 
 
 class SessionCreateResult(Result):
