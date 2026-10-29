@@ -1,6 +1,6 @@
 """Regressions for domain-layer descendant invalidation on ancestor reopen.
 
-``kanban_db.invalidate_descendants_for_parent_reopen`` is the single
+``hermes_cli.kanban_db_reopen.invalidate_descendants_for_parent_reopen`` is the single
 implementation of "a done ancestor was reopened, retract everything that
 assumed its result" (M3). These tests pin:
 
@@ -24,6 +24,7 @@ import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_db_reopen as kbr
 
 
 @pytest.fixture
@@ -62,7 +63,7 @@ def test_reopen_demotes_done_descendants_with_events_and_comments(conn):
     assert kb.complete_task(conn, grandchild_id, result="done")
 
     _reopen_parent_directly(conn, parent_id)
-    result = kb.invalidate_descendants_for_parent_reopen(
+    result = kbr.invalidate_descendants_for_parent_reopen(
         conn, parent_id, author="operator",
     )
 
@@ -120,7 +121,7 @@ def test_running_descendant_event_precedes_termination_via_reclaim_helper(
     monkeypatch.setattr(kb, "_terminate_reclaimed_worker", fake_terminate)
 
     _reopen_parent_directly(conn, parent_id)
-    result = kb.invalidate_descendants_for_parent_reopen(
+    result = kbr.invalidate_descendants_for_parent_reopen(
         conn, parent_id, author="operator",
     )
 
@@ -143,7 +144,7 @@ def test_counter_reset_on_invalidated_descendants(conn):
         )
 
     _reopen_parent_directly(conn, parent_id)
-    kb.invalidate_descendants_for_parent_reopen(conn, parent_id, author="op")
+    kbr.invalidate_descendants_for_parent_reopen(conn, parent_id, author="op")
 
     child = kb.get_task(conn, child_id)
     assert child is not None
@@ -204,7 +205,7 @@ def test_dashboard_and_db_paths_produce_identical_outcomes(tmp_path, monkeypatch
                 "WHERE id = ?",
                 (db_parent,),
             )
-        kb.invalidate_descendants_for_parent_reopen(
+        kbr.invalidate_descendants_for_parent_reopen(
             c, db_parent, author="dashboard",
         )
 
