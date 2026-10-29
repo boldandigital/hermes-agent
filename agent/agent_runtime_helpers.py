@@ -1222,10 +1222,61 @@ def try_recover_primary_transport(
         return False
 
 
+def _summary_lead_text(content: Any) -> str:
+    """The leading text of a user row, or '' when it has none.
+
+    A compaction summary lives in a USER row. It is either the row's whole string
+    content, or the first text block of a block-list content.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str):
+                return block["text"]
+            if isinstance(block, str):
+                return block
+        return ""
+    return ""
+
+
+def _is_summary_content(content: Any) -> bool:
+    """Whether a user row carries a compaction summary.
+
+    The prefixes live in ``agent.context_compressor``; the import is function-local
+    because that module imports this one (a module-level import would be circular).
+    """
+    text = _summary_lead_text(content).lstrip()
+    if not text:
+        return False
+    try:
+        from agent.context_compressor import (
+            LEGACY_SUMMARY_PREFIX,
+            SUMMARY_PREFIX,
+            _HISTORICAL_SUMMARY_PREFIXES,
+        )
+    except Exception:  # pragma: no cover - the compressor is optional here
+        return False
+    if text.startswith(SUMMARY_PREFIX) or text.startswith(LEGACY_SUMMARY_PREFIX):
+        return True
+    return any(text.startswith(prefix) for prefix in _HISTORICAL_SUMMARY_PREFIXES)
+
+
 def _merge_user_content(prev_content: Any, cur_content: Any) -> Any:
     """Merged content for two adjacent user messages (``_UNMERGEABLE`` for unknown shapes):
-    string+string joins with a blank line; list sides append as separate blocks."""
+    string+string joins with a blank line; list sides append as separate blocks.
+
+    A compaction summary REPLACES a previous summary (#compactions must not compound):
+    the summary is written back as a user row, and the next compaction merges that row
+    with the freshly generated summary. Concatenating the two embedded each summary in
+    its successor, so the compressed context grew ~2x per pass until the summary alone
+    exceeded the compaction trigger and the compressor could not compress further.
+    Two summaries therefore collapse to the newest one; a summary followed by a real
+    user turn keeps both (the summary is not duplicated).
+    """
     if isinstance(prev_content, str) and isinstance(cur_content, str):
+        if _is_summary_content(prev_content) and _is_summary_content(cur_content):
+            return cur_content
         return prev_content + ("\n\n" if prev_content and cur_content else "") + cur_content
     if isinstance(prev_content, list) and isinstance(cur_content, list):
         return list(prev_content) + list(cur_content)
