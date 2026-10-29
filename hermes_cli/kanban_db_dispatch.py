@@ -1924,7 +1924,7 @@ def configured_lane_capacities() -> Optional[dict[str, int]]:
         return None
     capacities, error = _kbl.parse_lane_capacities(raw)
     if error:
-        _kb._log.warning("kanban dispatch: ignoring kanban.lanes — %s", error)
+        _kb._log.warning("kanban dispatch: ignoring the lane configuration — %s", error)
         return None
     return capacities
 

@@ -66,7 +66,7 @@ def parse_lane_capacities(raw: Any) -> tuple[Optional[dict[str, int]], Optional[
             f"{type(raw).__name__}"
         )
     if not raw:
-        return None, "kanban.lanes is empty — no lane could run"
+        return None, "kanban.lanes is empty — no lane capacity declared"
     known = lane_names()
     capacities: dict[str, int] = {}
     for name, value in raw.items():

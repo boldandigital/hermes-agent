@@ -83,7 +83,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         # board keeps its single shared pool rather than wedging on a typo.
         lane_capacities, lane_error = _kbl.parse_lane_capacities(_kanban_cfg.get("lanes"))
         if lane_error:
-            _err(f"kanban.lanes: {lane_error} — ignoring the lane configuration")
+            _err(f"{lane_error} — ignoring the lane configuration")
     except Exception:
         default_assignee = max_in_progress_per_profile = max_in_progress = None
         max_spawn = getattr(args, "max", None)

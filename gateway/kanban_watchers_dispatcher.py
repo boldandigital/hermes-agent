@@ -110,7 +110,7 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
     from hermes_cli import kanban_db_lanes as _kbl
     lane_capacities, lane_error = _kbl.parse_lane_capacities(kanban_cfg.get("lanes"))
     if lane_error:
-        logger.warning("kanban dispatcher: ignoring kanban.lanes — %s", lane_error)
+        logger.warning("kanban dispatcher: ignoring the lane configuration — %s", lane_error)
         lane_capacities = None
     elif lane_capacities:
         logger.info("kanban dispatcher: kanban.lanes=%s", lane_capacities)
