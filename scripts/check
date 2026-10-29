@@ -115,7 +115,10 @@ _GUARDS = {
 }
 # Guards that judge a diff, not a tree: they get the same base/head as the ratchet
 # (blob-size-check.yml).
-_DIFF_GUARDS = {"blob-size": ["scripts/ci/check_blob_size.py"]}
+_DIFF_GUARDS = {
+    "blob-size": ["scripts/ci/check_blob_size.py"],
+    "self-approving": ["scripts/ci/check_self_approving_commit.py"],
+}
 _CHECKS = (*_GUARDS, *_DIFF_GUARDS, "ruff", "health")
 
 
