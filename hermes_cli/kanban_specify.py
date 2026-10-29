@@ -55,7 +55,20 @@ Rules:
     NOT invent a different project.
   - If the original idea is already detailed, preserve its substance and
     just reformat into the sections above.
+  - Before a step becomes part of the spec, ask: would this step give the
+    same output every time for the same input? If yes, it is CODE, not a
+    model call — name the exact runnable command or script in the
+    approach, and make the acceptance criterion that command's exit
+    status / output.
+  - Reserve model steps for judgement calls: design, copy, ambiguity.
+  - Make each acceptance criterion executable where possible — each
+    acceptance criterion names a command and its expected result, not a
+    prose wish.
   - Never add invented requirements the user didn't hint at.
+  - End the body with exactly ONE line `RISK: high|normal|low`. Use
+    `RISK: high` when the work touches money, auth, secrets, a
+    live-client, is irreversible, or is destructive; `RISK: normal` for
+    routine code; `RISK: low` for docs and cosmetic changes.
   - No preamble, no closing remarks, no code fences around the JSON.
   - Output only the JSON object and nothing else.
 """

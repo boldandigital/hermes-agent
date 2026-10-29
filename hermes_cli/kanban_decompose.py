@@ -74,6 +74,16 @@ Rules:
     and the system will route to the default_assignee.
   - Each child task body is what a fresh worker will read with no other
     context — be specific about goal, approach, and acceptance criteria.
+  - Before a step becomes a child task, ask: would this step give the
+    same output every time for the same input? If yes, it is CODE, not a
+    model call — name the exact runnable command or script in the body,
+    and make the acceptance criterion that command's exit status /
+    output.
+  - Reserve model steps for judgement calls: design, copy, ambiguity.
+  - End each child body with exactly ONE line `RISK: high|normal|low`.
+    Use `RISK: high` when the work touches money, auth, secrets, a
+    live-client, is irreversible, or is destructive; `RISK: normal` for
+    routine code; `RISK: low` for docs and cosmetic changes.
 
 When the task is genuinely a single unit of work (no useful decomposition),
 return:
@@ -88,7 +98,8 @@ return:
 
 In that case the task stays as one work item, just with a tightened spec and
 a concrete assignee. If no profile fits, use null and the system will route to
-the default_assignee.
+the default_assignee. The single-task body follows the same rules: the
+CODE-vs-model-call question, and one closing `RISK: high|normal|low` line.
 
 No preamble, no closing remarks, no code fences. Output only the JSON object.
 """
