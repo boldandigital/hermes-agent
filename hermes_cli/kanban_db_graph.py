@@ -182,6 +182,7 @@ def _insert_decomposed_child(
     """
     from hermes_cli.kanban_db import (
         _new_task_id, _canonical_assignee, _append_event, resolve_task_priority,
+        resolve_task_risk_lane,
     )
 
     root_ws_kind = root_row["workspace_kind"] or "scratch"
@@ -200,15 +201,17 @@ def _insert_decomposed_child(
     # This path bypasses ``create_task``, so the RISK line is resolved here too
     # — a card that only ranks by risk on the specify path is a half-dead rule.
     priority = resolve_task_priority(body)
+    risk_lane = resolve_task_risk_lane(body)
     conn.execute(
         "INSERT INTO tasks "
         "(id, title, body, assignee, status, priority, workspace_kind, "
-        " workspace_path, tenant, created_at, created_by) "
-        "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?)",
+        " workspace_path, tenant, created_at, created_by, risk_lane) "
+        "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?)",
         (
             new_id, child["title"].strip(), body,
             _canonical_assignee(child.get("assignee")), priority, child_ws_kind,
             child_ws_path, root_row["tenant"], now, (author or "decomposer"),
+            risk_lane,
         ),
     )
     _append_event(

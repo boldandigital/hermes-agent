@@ -118,12 +118,15 @@ VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 # A card body states its own risk class in one ``RISK:`` line; the class — not
 # the clock — decides what the dispatcher schedules first.
 RISK_PRIORITY = {"high": 90, "normal": 50, "low": 10}
+# The risk classes ARE the dispatch lanes: one vocabulary, one mapping point.
+RISK_LANES = tuple(RISK_PRIORITY)
+DEFAULT_RISK_LANE = "normal"
 DEFAULT_TASK_PRIORITY = RISK_PRIORITY["normal"]
 _RISK_LINE_RE = re.compile(r"^\s*risk\s*:\s*(?P<value>.*?)\s*$", re.IGNORECASE)
 
 
-def priority_from_risk_line(body: Optional[str]) -> Optional[int]:
-    """The priority a card body asks for in its ``RISK:`` line, or ``None``.
+def risk_from_risk_line(body: Optional[str]) -> Optional[str]:
+    """The risk class a card body asks for in its ``RISK:`` line, or ``None``.
 
     The first ``RISK:`` line in the body decides; surrounding whitespace and
     case are forgiven. A value outside the taxonomy is ignored rather than
@@ -135,8 +138,30 @@ def priority_from_risk_line(body: Optional[str]) -> Optional[int]:
         match = _RISK_LINE_RE.match(line)
         if match is None:
             continue
-        return RISK_PRIORITY.get(match.group("value").strip().lower())
+        value = match.group("value").strip().lower()
+        return value if value in RISK_PRIORITY else None
     return None
+
+
+def priority_from_risk_line(body: Optional[str]) -> Optional[int]:
+    """The priority a card body asks for in its ``RISK:`` line, or ``None``.
+
+    Delegates the parse to :func:`risk_from_risk_line` — one parser, one
+    mapping point — so the class and the priority it maps to can never
+    disagree.
+    """
+    risk = risk_from_risk_line(body)
+    return RISK_PRIORITY.get(risk) if risk is not None else None
+
+
+def resolve_task_risk_lane(body: Optional[str]) -> str:
+    """The dispatch lane a card belongs to, read from its ``RISK:`` line.
+
+    A card with no (or an unknown) risk class is normal risk — the same lane a
+    legacy row without the column is read as, so the lane a card gets never
+    depends on how it was created.
+    """
+    return risk_from_risk_line(body) or DEFAULT_RISK_LANE
 
 
 def resolve_task_priority(body: Optional[str], priority: int = 0) -> int:
@@ -675,6 +700,9 @@ class Task:
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
     completion_contract: Optional[str] = None
+    # Dispatch lane (high|normal|low) captured from the body's ``RISK:`` line
+    # at creation time. NULL = legacy row, read as the normal lane.
+    risk_lane: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Task:
@@ -707,6 +735,7 @@ _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "current_run_id", "workflow_template_id",
     "current_step_key", "max_retries", "session_id", "completion_contract",
+    "risk_lane",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
@@ -911,7 +940,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Dispatch lane: the card's risk class (high|normal|low), captured from its
+    -- ``RISK:`` line when the card is created. Durable on the row, so the
+    -- dispatcher never re-parses the body. NULL = legacy row, read as the
+    -- normal lane.
+    risk_lane            TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1307,8 +1341,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, completion_contract,
+                        risk_lane
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1318,6 +1353,7 @@ def create_task(
                         json.dumps(skills_list) if skills_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
+                        resolve_task_risk_lane(body),
                     ),
                 )
                 for pid in parents:

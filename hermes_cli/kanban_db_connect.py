@@ -886,6 +886,9 @@ _LATER_TASK_COLUMNS = (
     ("block_recurrences", "block_recurrences INTEGER NOT NULL DEFAULT 0"),
     # Spawn-time start fingerprint of worker_pid (PID-reuse guard; NULL = legacy row).
     ("worker_started_at", "worker_started_at INTEGER"),
+    # Dispatch lane (high|normal|low) captured from the card body's ``RISK:``
+    # line at creation time; NULL = legacy row, read as the normal lane.
+    ("risk_lane", "risk_lane TEXT"),
 )
 
 _NOTIFY_SUB_COLUMNS = (
