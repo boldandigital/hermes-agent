@@ -126,6 +126,10 @@ class DispatchResult:
     """``(task_id, assignee, current_running_count)`` deferred because the
     assignee is at ``kanban.max_in_progress_per_profile``. Picked up on a later
     tick; separate bucket so dashboards show "profile busy" vs "stuck"."""
+    skipped_lane_capped: list[tuple[str, str, int]] = field(default_factory=list)
+    """``(task_id, lane, capacity)`` deferred because that risk lane is at its
+    ``kanban.lanes`` capacity. Picked up on a later tick; separate bucket so
+    dashboards show "lane full" vs "stuck"."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -1991,6 +1995,7 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    lane_capacities: Optional[dict[str, int]] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -2014,6 +2019,7 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
+            lane_capacities=lane_capacities,
         )
 
     try:
@@ -2063,12 +2069,24 @@ def _dispatch_lane_task(
     spawn_fn,
     per_profile_cap: Optional[int],
     per_profile_running: dict[str, int],
+    lane_capacities: Optional[dict[str, int]] = None,
+    lane_running: Optional[dict[str, int]] = None,
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
     skip is recorded on ``result``.
     """
     task_id = row["id"]
+    # Risk lane capacity (``kanban.lanes``): a lane at its capacity defers its
+    # OWN cards only — the other lanes keep their capacity, so urgent work is
+    # never queued behind cosmetic work. Checked first because it is the
+    # scheduling decision; the task-state checks below do not change it.
+    risk_lane = _kbl.normalize_lane(_kb._row_get(row, "risk_lane"))
+    lane_capacity = (lane_capacities or {}).get(risk_lane)
+    lane_counts = lane_running if lane_running is not None else {}
+    if lane_capacity is not None and lane_counts.get(risk_lane, 0) >= lane_capacity:
+        result.skipped_lane_capped.append((task_id, risk_lane, lane_capacity))
+        return False
     # Non-profile assignees (control-plane lanes that pull via ``claim_task``)
     # would fail ``hermes -p <assignee>`` at startup and loop ready→crash→ready
     # forever. Bucketed apart from skipped_unassigned: the operator cannot fix
@@ -2117,6 +2135,10 @@ def _dispatch_lane_task(
         # ticks re-query from the DB.
         if per_profile_cap is not None and name:
             per_profile_running[name] = per_profile_running.get(name, 0) + 1
+        # Same for the risk lane: a card that just started consumes its lane's
+        # capacity for the rest of this tick.
+        if lane_capacity is not None:
+            lane_counts[risk_lane] = lane_counts.get(risk_lane, 0) + 1
 
     if dry_run:
         result.spawned.append((task_id, assignee, ""))
@@ -2296,7 +2318,7 @@ def _tick_spawn_budget(
 def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
     """Unclaimed rows of one lane in dispatch order."""
     return conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, risk_lane FROM tasks "
         f"WHERE status = '{status}' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -2308,19 +2330,23 @@ def _any_spawnable_review(
     *,
     per_profile_cap: Optional[int] = None,
     per_profile_running: Optional[dict[str, int]] = None,
+    lane_capacities: Optional[dict[str, int]] = None,
+    lane_running: Optional[dict[str, int]] = None,
 ) -> bool:
     """Mirror review dispatch gates before reserving ready-lane capacity.
 
     Unavailable profile metadata retains the historic fail-open behavior. A
     review row that :func:`_dispatch_lane_task` would refuse this tick — its
-    assignee already at the per-profile cap, or respawn-guarded — cannot
-    consume the reservation, so it must not withhold capacity from an
-    otherwise ready task (one such row would pin ``ready_budget`` to 0).
+    assignee already at the per-profile cap, respawn-guarded, or its risk lane
+    at its ``kanban.lanes`` capacity — cannot consume the reservation, so it
+    must not withhold capacity from an otherwise ready task (one such row would
+    pin ``ready_budget`` to 0).
     """
     if not review_rows:
         return False
     profile_exists = _profile_exists_fn()
     running = per_profile_running or {}
+    lane_counts = lane_running or {}
     for row in review_rows:
         assignee = row["assignee"]
         if not assignee:
@@ -2328,6 +2354,10 @@ def _any_spawnable_review(
         if profile_exists is not None and not profile_exists(assignee):
             continue
         if per_profile_cap is not None and running.get(assignee, 0) >= per_profile_cap:
+            continue
+        risk_lane = _kbl.normalize_lane(_kb._row_get(row, "risk_lane"))
+        lane_capacity = (lane_capacities or {}).get(risk_lane)
+        if lane_capacity is not None and lane_counts.get(risk_lane, 0) >= lane_capacity:
             continue
         if check_respawn_guard(conn, row["id"], lane="review") is None:
             return True
@@ -2366,12 +2396,13 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    lane_capacities: Optional[dict[str, int]] = None,
 ) -> DispatchResult:
     """One dispatcher tick: reclaim stale/crashed running tasks, promote
     todo -> ready, then atomically claim each spawnable ready/review row and
     call ``spawn_fn(task, workspace_path, board) -> Optional[int]``, recording
     the PID so later ticks catch crashes before the TTL. Cap semantics:
-    :func:`_tick_spawn_budget`."""
+    :func:`_tick_spawn_budget` and ``kanban.lanes`` (risk-lane capacity)."""
     result = DispatchResult()
     _run_reclaim_phase(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,
@@ -2407,6 +2438,12 @@ def _dispatch_once_locked(
             "GROUP BY assignee"
         ):
             per_profile_running[prow["assignee"]] = int(prow["n"])
+    # Risk-lane capacity (``kanban.lanes``): how many cards of each lane are
+    # already running. Empty when no lanes are configured — then the board
+    # keeps its single shared pool and nothing below changes.
+    lane_running: dict[str, int] = {}
+    if lane_capacities:
+        lane_running = _kbl.running_counts_by_lane(conn)
     # Review-lane reservation: the ready loop runs first and would otherwise
     # consume the ENTIRE shared budget, starving reviews under a sustained ready
     # backlog. When spawnable review work exists and there is any budget, hold
@@ -2415,12 +2452,14 @@ def _dispatch_once_locked(
     if spawn_budget is not None and spawn_budget > 0 and _any_spawnable_review(
         conn, review_rows,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
+        lane_capacities=lane_capacities, lane_running=lane_running,
     ):
         ready_budget = max(spawn_budget - 1, 0)
     lane_kwargs: dict[str, Any] = dict(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
+        lane_capacities=lane_capacities, lane_running=lane_running,
     )
     default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0
@@ -2961,4 +3000,5 @@ def run_daemon(
 # module is fully populated before ``kanban_db`` imports from it.
 from hermes_cli import kanban_db as _kb
 from hermes_cli import kanban_db_connect as _kbc
+from hermes_cli import kanban_db_lanes as _kbl
 from hermes_cli import kanban_db_workspace as _kbw

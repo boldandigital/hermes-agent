@@ -12,6 +12,7 @@ With ``kanban.lanes`` unset the dispatcher behaves exactly as it did before.
 from __future__ import annotations
 
 import sqlite3
+import time
 from pathlib import Path
 
 import pytest
@@ -125,3 +126,200 @@ def test_the_risk_line_parser_reports_the_class():
 
 def test_the_lane_vocabulary_is_the_risk_vocabulary():
     assert kb.RISK_LANES == tuple(kb.RISK_PRIORITY)
+
+
+# ── the lane capacity configuration ─────────────────────────────────────────
+
+def _lanes():
+    from hermes_cli import kanban_db_lanes as kbl
+    return kbl
+
+
+def test_a_valid_lane_mapping_is_accepted():
+    caps, error = _lanes().parse_lane_capacities({"high": 1, "normal": 2, "low": 3})
+    assert error is None
+    assert caps == {"high": 1, "normal": 2, "low": 3}
+
+
+def test_no_lane_configuration_means_no_lanes():
+    assert _lanes().parse_lane_capacities(None) == (None, None)
+
+
+@pytest.mark.parametrize("raw", [
+    [1, 2],            # wrong type
+    "high",            # wrong type
+    {"high": -1},      # negative capacity
+    {"urgent": 1},     # unknown lane name
+    {"high": 0},       # zero capacity
+    {"high": "1"},     # capacity is not a number
+    {},                # no lane at all
+], ids=["list", "string", "negative", "unknown-lane", "zero", "non-number", "empty"])
+def test_a_malformed_lane_mapping_is_refused(raw):
+    """One bad entry disables the whole mapping — never a partial lane plan."""
+    caps, error = _lanes().parse_lane_capacities(raw)
+    assert caps is None
+    assert error, "a malformed lane mapping must name the problem"
+
+
+# ── dispatch honours the lane capacity ──────────────────────────────────────
+
+def _card(conn, *, title: str, risk: str, assignee: str = "alice") -> str:
+    tid = kb.create_task(conn, title=title, body=f"Goal\nRISK: {risk}\n", assignee=assignee)
+    conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+    conn.commit()
+    return tid
+
+
+def _hold_a_slot(conn, task_id: str) -> None:
+    """Park a card in ``running`` so it occupies one concurrency slot."""
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET status = 'running', claim_lock = 'lock-holder', "
+            "claim_expires = ? WHERE id = ?",
+            (int(time.time()) + 3600, task_id),
+        )
+
+
+def _spawned_ids(result) -> list[str]:
+    return [row[0] for row in result.spawned]
+
+
+def test_a_card_of_a_full_lane_is_deferred_while_another_lane_runs(
+    conn, all_assignees_spawnable,
+):
+    """The teeth of a lane cap: it holds BACK its own cards, not the board.
+
+    Without lanes both ready cards would spawn (the ceiling leaves room for
+    both); with ``low`` already at capacity only the high-risk card runs.
+    """
+    low = _card(conn, title="low risk card", risk="low")
+    _hold_a_slot(conn, low)
+    high = _card(conn, title="high risk card", risk="high")
+    low2 = _card(conn, title="second low risk card", risk="low")
+
+    result = kbd.dispatch_once(
+        conn, spawn_fn=lambda *a, **k: 4242,
+        max_in_progress=3,
+        lane_capacities={"high": 1, "normal": 1, "low": 1},
+    )
+
+    assert _spawned_ids(result) == [high]
+    assert result.skipped_lane_capped == [(low2, "low", 1)]
+
+
+def test_without_lane_capacities_the_board_behaves_exactly_as_before(
+    conn, all_assignees_spawnable,
+):
+    """``kanban.lanes`` unset = one shared pool, unchanged."""
+    low = _card(conn, title="low risk card", risk="low")
+    _hold_a_slot(conn, low)
+    high = _card(conn, title="high risk card", risk="high")
+    low2 = _card(conn, title="second low risk card", risk="low")
+
+    result = kbd.dispatch_once(
+        conn, spawn_fn=lambda *a, **k: 4242,
+        max_in_progress=3,
+    )
+
+    assert _spawned_ids(result) == [high, low2]
+    assert result.skipped_lane_capped == []
+
+
+def test_a_high_risk_card_dispatches_while_a_low_risk_card_holds_the_pool(
+    conn, all_assignees_spawnable,
+):
+    """The acceptance case: low-risk work holds a slot, high-risk work still runs."""
+    low = _card(conn, title="low risk card", risk="low")
+    _hold_a_slot(conn, low)
+    high = _card(conn, title="high risk card", risk="high")
+
+    result = kbd.dispatch_once(
+        conn, spawn_fn=lambda *a, **k: 4242,
+        max_in_progress=2,
+        lane_capacities={"high": 1, "normal": 1, "low": 1},
+    )
+
+    assert _spawned_ids(result) == [high]
+    running = conn.execute(
+        "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
+    ).fetchone()[0]
+    assert running == 2, "the high-risk card runs beside the low-risk one"
+
+
+def test_a_lane_capacity_never_exceeds_the_hard_ceiling(conn, all_assignees_spawnable):
+    """``kanban.max_in_progress`` stays the ceiling; a lane only subdivides it."""
+    high1 = _card(conn, title="high one", risk="high")
+    _card(conn, title="high two", risk="high")
+
+    result = kbd.dispatch_once(
+        conn, spawn_fn=lambda *a, **k: 4242,
+        max_in_progress=1,
+        lane_capacities={"high": 5},
+    )
+
+    assert _spawned_ids(result) == [high1]
+
+
+def test_a_lane_capacity_of_one_defers_the_second_card_of_that_lane(
+    conn, all_assignees_spawnable,
+):
+    high1 = _card(conn, title="high one", risk="high")
+    high2 = _card(conn, title="high two", risk="high")
+
+    result = kbd.dispatch_once(
+        conn, spawn_fn=lambda *a, **k: 4242,
+        max_in_progress=3,
+        lane_capacities={"high": 1},
+    )
+
+    assert _spawned_ids(result) == [high1]
+    assert result.skipped_lane_capped == [(high2, "high", 1)]
+
+
+def test_a_running_card_without_a_stored_lane_counts_as_normal(
+    conn, all_assignees_spawnable,
+):
+    """A card from before the lane column reads as ``normal``, not as uncapped."""
+    legacy = _card(conn, title="legacy card", risk="normal")
+    conn.execute("UPDATE tasks SET risk_lane = NULL WHERE id = ?", (legacy,))
+    conn.commit()
+    _hold_a_slot(conn, legacy)
+    normal = _card(conn, title="normal card", risk="normal")
+
+    result = kbd.dispatch_once(
+        conn, spawn_fn=lambda *a, **k: 4242,
+        max_in_progress=3,
+        lane_capacities={"high": 1, "normal": 1, "low": 1},
+    )
+
+    assert _spawned_ids(result) == []
+    assert result.skipped_lane_capped == [(normal, "normal", 1)]
+
+
+def test_a_card_deferred_by_its_lane_runs_on_a_later_tick(
+    conn, all_assignees_spawnable,
+):
+    """A lane cap is per-tick state, not a permanent block."""
+    low = _card(conn, title="low risk card", risk="low")
+    _hold_a_slot(conn, low)
+    low2 = _card(conn, title="second low risk card", risk="low")
+
+    first = kbd.dispatch_once(
+        conn, spawn_fn=lambda *a, **k: 4242,
+        max_in_progress=3,
+        lane_capacities={"high": 1, "normal": 1, "low": 1},
+    )
+    assert first.skipped_lane_capped == [(low2, "low", 1)]
+
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET status = 'done', claim_lock = NULL, claim_expires = NULL "
+            "WHERE id = ?", (low,),
+        )
+
+    second = kbd.dispatch_once(
+        conn, spawn_fn=lambda *a, **k: 4242,
+        max_in_progress=3,
+        lane_capacities={"high": 1, "normal": 1, "low": 1},
+    )
+    assert _spawned_ids(second) == [low2]
