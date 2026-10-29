@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "description": "Guard tests and the production sources they guard. A commit that changes both sides of a pair approves itself: the widened guard test can no longer fail the change the commit allows. Split the commit instead (guard test first, source change second). Paths are repo-relative, forward slashes; a test may guard several sources. The guard's own test file (tests/ci/test_check_self_approving_commit.py) is deliberately NOT registered: registering it would make the guard flag the very commit that adds it.",
+  "pairs": [
+    {
+      "test": "tests/pm/test_doctor_dependency_drift.py",
+      "sources": ["pm/doctor.py", "pm/cli.py"]
+    },
+    {
+      "test": "tests/pm/test_pm_authority.py",
+      "sources": ["pm/cli.py", "pm/install.py", "pm/store.py"]
+    },
+    {
+      "test": "tests/ci/test_check_blob_size.py",
+      "sources": ["scripts/ci/check_blob_size.py"]
+    }
+  ]
+}
