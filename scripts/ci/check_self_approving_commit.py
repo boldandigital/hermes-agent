@@ -12,6 +12,13 @@ The mapping from guard test to guarded source lives in one reviewed file,
 the verdict of a commit never flips because of an unrelated edit: a commit is self-approving if,
 and only if, one commit changes both sides of a registered pair.
 
+A merge commit is judged on the changes it introduces itself -- its own resolution, read from
+the combined diff -- so a merge that widens a guard test AND changes the guarded source is a
+self-approving change and is reported like any other commit. A merge that only combines two
+separately good commits (one commit widens the guard, another changes the source) introduces
+neither change itself and is therefore not a finding. The remedy is the same in both cases:
+split the work into separate commits -- the guard test first, the source change second.
+
     python scripts/ci/check_self_approving_commit.py                    # merge-base with main..HEAD
     python scripts/ci/check_self_approving_commit.py --base A --head B  # any two revisions
     python scripts/ci/check_self_approving_commit.py --head REV         # one commit
@@ -87,8 +94,15 @@ def load_registry(path: Path) -> list[Pair]:
 
 
 def _commit_paths(repo: Path, commit: str) -> frozenset[str]:
-    """Every path the commit touches: added, modified, deleted or renamed to or from."""
-    out = gitio.git(repo, "diff-tree", "--no-commit-id", "--name-only", "-r", "--root",
+    """Every path the commit touches: added, modified, deleted or renamed to or from.
+
+    The combined diff (``--cc``) is the one form that answers the same question for every kind
+    of commit: for an ordinary commit and for a root commit it lists exactly the paths that
+    commit changed, and for a merge commit it lists the paths the merge changed itself, relative
+    to all of its parents -- its own resolution. A plain ``diff-tree`` prints nothing at all for
+    a merge, which would judge a self-approving merge as touching nothing.
+    """
+    out = gitio.git(repo, "diff-tree", "--cc", "--no-commit-id", "--name-only", "-r", "--root",
                     "--no-renames", "-z", commit)
     return frozenset(path for path in out.split("\0") if path)
 
